@@ -1,8 +1,20 @@
 require('dotenv').config();
 
 const { prisma } = require('./prisma');
+const {
+  initializeEnterpriseIntegration,
+  getEnterpriseIntegrationStatus,
+} = require('./enterprise/integration/enterprise.bootstrap');
+
+const enterpriseIntegrationStatus = initializeEnterpriseIntegration();
 
 console.log('🔥 INDEX.JS INICIADO!');
+console.log('🏢 Enterprise overlay:', {
+  enabled: enterpriseIntegrationStatus.enabled,
+  mode: enterpriseIntegrationStatus.mode,
+  auditEnabled: enterpriseIntegrationStatus.auditEnabled,
+  policyEnabled: enterpriseIntegrationStatus.policyEnabled,
+});
 
 // =========================
 // START SERVER
