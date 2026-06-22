@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: kulipapay-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install && npx prisma generate
+    startCommand: node src/index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: JWT_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false

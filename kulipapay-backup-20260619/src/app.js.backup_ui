@@ -1,0 +1,98 @@
+require('dotenv').config();
+
+const authRoutes = require('./routes/auth.routes');
+const merchantRoutes = require('./routes/merchant.routes');
+const walletRoutes = require('./routes/wallet.routes');
+const cashierRoutes = require('./routes/cashier.routes');
+const regionRoutes = require('./routes/region.routes');
+const transactionRoutes = require('./routes/transaction.routes');
+
+// NOVO: Módulos v2
+const authModuleRoutes = require('./modules/auth/auth.routes');
+const identityModuleRoutes = require('./modules/identity/identity.routes');
+
+const cors = require('@fastify/cors');
+const rateLimit = require('@fastify/rate-limit');
+
+console.log('🔥 APP.JS CARREGADO!');
+
+module.exports = async function (fastify) {
+  console.log('📌 A REGISTAR PLUGINS...');
+  
+  const { handleError } = require('./utils/errors');
+
+  fastify.setErrorHandler((error, request, reply) => {
+    handleError(error, reply);
+  });
+
+  fastify.register(cors, {
+    origin: true,
+    credentials: true
+  });
+
+  fastify.register(rateLimit, {
+    max: 100,
+    timeWindow: '1 minute',
+    allowList: [],
+    errorResponseBuilder: () => ({
+      success: false,
+      error: {
+        code: 'RATE_LIMIT',
+        message: 'Too many requests',
+        statusCode: 429
+      }
+    })
+  });
+
+  fastify.get('/health', async () => {
+    return {
+      status: 'ok',
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString()
+    };
+  });
+
+  console.log('📌 A REGISTAR ROTAS...');
+
+  // =========================
+  // ROTAS ANTIGAS (v1) - CONTINUAM A FUNCIONAR
+  // =========================
+  await fastify.register(authRoutes, { prefix: '/api/auth' });
+  await fastify.register(merchantRoutes, { prefix: '/api/merchant' });
+  await fastify.register(walletRoutes, { prefix: '/api/wallet' });
+  await fastify.register(cashierRoutes, { prefix: '/api/cashier' });
+  await fastify.register(regionRoutes, { prefix: '/api/regions' });
+  await fastify.register(transactionRoutes, { prefix: '/api' });
+
+  // =========================
+  // NOVAS ROTAS (v2) - ARQUITETURA MODULAR
+  // =========================
+  await fastify.register(authModuleRoutes, { prefix: '/api/v2/auth' });
+  await fastify.register(identityModuleRoutes, { prefix: '/api/v2/identity' });
+
+  console.log('✅ Routes loaded successfully');
+  console.log('   🟢 v1 (legacy):');
+  console.log('   - /api/auth/login');
+  console.log('   - /api/auth/me');
+  console.log('   - /api/merchant/dashboard');
+  console.log('   - /api/wallet/balance');
+  console.log('   ');
+  console.log('   🟣 v2 (modular):');
+  console.log('   - /api/v2/auth/login');
+  console.log('   - /api/v2/auth/otp/verify');
+  console.log('   - /api/v2/identity/me');
+
+  fastify.setNotFoundHandler((request, reply) => {
+    reply.status(404).send({
+      success: false,
+      error: {
+        code: 'NOT_FOUND',
+        message: 'Route not found',
+        statusCode: 404
+      }
+    });
+  });
+
+  console.log('✅ APP.JS CONFIGURADO COM SUCESSO!');
+  return fastify;
+};

@@ -1,0 +1,578 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AccountType {
+  INDIVIDUAL
+  BUSINESS
+  MERCHANT
+  AGENT
+  ENTERPRISE
+}
+
+enum TransactionStatus {
+  PENDING
+  HELD
+  RESERVED
+  SETTLED
+  CONFIRMED
+  REJECTED
+  EXPIRED
+  REVERSED
+  RECEIVER_PENDING
+  RECEIVER_ACCEPTED
+  RECEIVER_REJECTED
+  SENDER_FINALIZED
+}
+
+enum TransactionMode {
+  INSTANT
+  SECURE
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  BLOCKED
+}
+
+enum PaymentIntentStatus {
+  CREATED
+  AWAITING_METHOD
+  AWAITING_PAYMENT
+  PROCESSING
+  SUCCESS
+  FAILED
+  EXPIRED
+}
+
+enum PosPaymentMethod {
+  WALLET_INTERNAL
+  EMOLA
+  MPESA
+  BANK_TRANSFER
+}
+
+// ============================================
+// 🧾 REFUND ENGINE
+// ============================================
+
+enum RefundStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+model Account {
+  id              String      @id @default(uuid())
+  kp_id           String      @unique
+  email           String?     @unique
+  phone           String      @unique
+  name            String?
+  password_hash   String
+  account_type    AccountType @default(INDIVIDUAL)
+  role            String      @default("USER")
+  status          String      @default("ACTIVE")
+  country         String      @default("MZ")
+
+  created_at      DateTime    @default(now())
+  updated_at      DateTime    @updatedAt
+
+  wallet          Wallet?
+  agent           Agent?
+  merchantProfile MerchantProfile?
+  enterpriseProfile EnterpriseProfile?
+  kyc             KycProfile?
+  sessions        Session[]
+  otp_codes       OtpCode[]
+  security_pin    SecurityPin?
+  risk_score      RiskScore?
+  fraud_alerts    FraudAlert[]
+  blocked_actions BlockedAction[]
+
+  ledger_entries  TransactionLedger[]
+  payments        PaymentTransaction[]
+  audit_logs      AuditLog[]
+  snapshots       BalanceSnapshot[]
+
+  @@map("accounts")
+}
+
+model Wallet {
+  id                String   @id @default(uuid())
+  kp_id             String   @unique
+  balance           Decimal  @default(0)
+  frozen_balance    Decimal  @default(0)
+  available_balance Decimal  @default(0)
+  version           Int      @default(1)
+  created_at        DateTime @default(now())
+  updated_at        DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("wallets")
+}
+
+model WalletLock {
+  kp_id     String   @id
+  locked_at DateTime @default(now())
+
+  @@map("wallet_locks")
+}
+
+model Agent {
+  id                       String   @id @default(uuid())
+  kp_id                    String   @unique
+  business_name            String
+  phone                    String   @unique
+  email                    String?  @unique
+  float_balance            Decimal  @default(0)
+  commission_rate          Float    @default(0.01)
+  deposit_commission_rate  Float    @default(0.025)
+  withdrawal_commission_rate Float  @default(0.02)
+  business_photo_url       String?
+  total_commission_earned  Decimal  @default(0)
+  total_deposits_volume    Decimal  @default(0)
+  total_withdrawals_volume Decimal  @default(0)
+  status                   String   @default("PENDING_KYC")
+  created_at               DateTime @default(now())
+  updated_at               DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("agents")
+}
+
+model MerchantProfile {
+  id            String   @id @default(uuid())
+  account_id    String   @unique
+  business_name String
+  business_type String?  @default("RETAIL")
+  tax_id        String?
+  status        String   @default("ACTIVE")
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  account Account @relation(fields: [account_id], references: [id])
+  
+  cashiers      Cashier[]
+  cashier_sessions CashierSession[]
+  payment_intents PaymentIntent[]
+  refunds       RefundRequest[]
+
+  @@map("merchant_profiles")
+}
+
+model EnterpriseProfile {
+  id                   String   @id @default(uuid())
+  account_id           String   @unique
+  business_name        String
+  tax_id               String?
+  industry             String?
+  business_license_url String?
+  status               String   @default("PENDING_KYC")
+  created_at           DateTime @default(now())
+  updated_at           DateTime @updatedAt
+
+  account Account @relation(fields: [account_id], references: [id])
+
+  @@map("enterprise_profiles")
+}
+
+model Transaction {
+  id              String   @id @default(uuid())
+  transactionId   String   @unique
+  from_kp         String
+  to_kp           String
+  amount          Decimal
+  fee             Decimal  @default(0)
+  status          TransactionStatus @default(PENDING)
+  mode            TransactionMode   @default(SECURE)
+  expired_at      DateTime?
+  description     String?
+  confirmed_at    DateTime?
+  confirmed_by    String?
+  debit_entry_id  String?
+  credit_entry_id String?
+  rejected_at     DateTime?
+  rejected_by     String?
+  reject_reason   String?
+  metadata        Json?
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  cashier_id      String?         @map("cashier_id")
+  cashier         Cashier?        @relation(fields: [cashier_id], references: [id])
+  session_id      String?         @map("session_id")
+  session         CashierSession? @relation(fields: [session_id], references: [id])
+  payment_intent_id String?       @map("payment_intent_id")
+  payment_intent  PaymentIntent?  @relation(fields: [payment_intent_id], references: [id])
+  
+  // 🧾 REFUND RELATIONS
+  refund_requests RefundRequest[] @relation("OriginalTransaction")
+  reversal_refunds RefundRequest[] @relation("ReversalTransaction")
+
+  @@map("transactions")
+}
+
+model TransactionLedger {
+  id              String   @id @default(uuid())
+  kp_id           String
+  type            String
+  amount          Decimal
+  balance_before  Decimal
+  balance_after   Decimal
+  reference       String   @unique
+  status          String
+  metadata        Json?
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("transaction_ledger")
+}
+
+model PaymentTransaction {
+  id          String   @id @default(uuid())
+  kp_id       String
+  type        String
+  amount      Decimal
+  fee         Decimal  @default(0)
+  status      String   @default("PENDING")
+  method      String
+  transactionId   String   @unique
+  provider        String
+  phone_number    String
+  provider_reference String?
+  provider_response Json?
+  idempotency_key String?  @unique
+  requested_at    DateTime @default(now())
+  reference   String   @unique
+  metadata    Json?
+  settled_at  DateTime?
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  cashier_id   String?  @map("cashier_id")
+  merchant_id  String?  @map("merchant_id")
+  session_id   String?  @map("session_id")
+  customer_name String?
+  service_type String?
+  description  String?
+  payment_intent_id String? @map("payment_intent_id")
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+  cashier Cashier? @relation(fields: [cashier_id], references: [id])
+  cashier_session CashierSession? @relation(fields: [session_id], references: [id])
+  payment_intent PaymentIntent? @relation(fields: [payment_intent_id], references: [id])
+
+  @@map("payment_transactions")
+}
+
+model KycProfile {
+  id            String   @id @default(uuid())
+  kp_id         String   @unique
+  full_name     String
+  document_id   String   @unique
+  status        String   @default("PENDING")
+  verified_at   DateTime?
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+}
+
+model Session {
+  id                  String   @id @default(uuid())
+  kp_id               String
+  access_token        String   @unique
+  refresh_token       String   @unique
+  family_id           String
+  device_id           String?
+  ip                  String?
+  user_agent          String?
+  fingerprint         String
+  revoked             Boolean  @default(false)
+  expires_at          DateTime
+  refresh_expires_at  DateTime
+  created_at          DateTime @default(now())
+  updated_at          DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@index([kp_id])
+  @@index([refresh_token])
+  @@map("sessions")
+}
+
+model OtpCode {
+  id         String   @id @default(uuid())
+  kp_id      String
+  code       String
+  type       String   @default("LOGIN")
+  used       Boolean  @default(false)
+  attempts   Int      @default(0)
+  expires_at DateTime
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@index([kp_id])
+  @@map("otp_codes")
+}
+
+model SecurityPin {
+  id          String   @id @default(uuid())
+  kp_id       String   @unique
+  pin_hash    String
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("security_pins")
+}
+
+model RiskScore {
+  id          String    @id @default(uuid())
+  kp_id       String    @unique
+  score       Int
+  level       RiskLevel
+  updated_at  DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("risk_scores")
+}
+
+model FraudAlert {
+  id          String   @id @default(uuid())
+  kp_id       String
+  reason      String
+  severity    String
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("fraud_alerts")
+}
+
+model BlockedAction {
+  id          String   @id @default(uuid())
+  kp_id       String
+  action      String
+  reason      String
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("blocked_actions")
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  kp_id       String
+  action      String
+  metadata    Json?
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("audit_logs")
+}
+
+model BalanceSnapshot {
+  id          String   @id @default(uuid())
+  kp_id       String
+  balance     Decimal
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("balance_snapshots")
+}
+
+// ============================================
+// ⭐ SISTEMA DE CAIXAS - MODELOS COMPLETOS
+// ============================================
+
+model Cashier {
+  id              String          @id @default(uuid())
+  merchant_id     String          @map("merchant_id")
+  merchant        MerchantProfile @relation(fields: [merchant_id], references: [account_id])
+  
+  name            String
+  email           String?
+  phone           String?
+  invite_code     String          @unique @map("invite_code")
+  
+  status          String          @default("PENDING")
+  
+  total_received  Float           @default(0)
+  transaction_count Int           @default(0)
+  
+  created_at      DateTime        @default(now())
+  updated_at      DateTime        @updatedAt
+  
+  sessions        CashierSession[]
+  ledger_transactions Transaction[]
+  payment_transactions PaymentTransaction[]
+  payment_intents PaymentIntent[]
+  
+  @@map("cashiers")
+}
+
+model CashierSession {
+  id              String          @id @default(uuid())
+  cashier_id      String          @map("cashier_id")
+  cashier         Cashier         @relation(fields: [cashier_id], references: [id])
+  merchant_id     String          @map("merchant_id")
+  merchant        MerchantProfile @relation(fields: [merchant_id], references: [account_id])
+  
+  device_id       String?
+  ip_address      String?
+  status          String          @default("ACTIVE")
+  opened_at       DateTime        @default(now())
+  closed_at       DateTime?
+  closed_by       String?         @map("closed_by")
+  
+  total_received  Float           @default(0)
+  transaction_count Int           @default(0)
+  
+  created_at      DateTime        @default(now())
+  updated_at      DateTime        @updatedAt
+  
+  ledger_transactions Transaction[]
+  payment_transactions PaymentTransaction[]
+  payment_intents PaymentIntent[]
+  
+  @@map("cashier_sessions")
+}
+
+model PaymentIntent {
+  id                     String              @id @default(uuid())
+  merchant_id            String              @map("merchant_id")
+  merchant               MerchantProfile     @relation(fields: [merchant_id], references: [account_id])
+  merchant_kp_id         String              @map("merchant_kp_id")
+  cashier_id             String              @map("cashier_id")
+  cashier                Cashier             @relation(fields: [cashier_id], references: [id])
+  cashier_session_id     String              @map("cashier_session_id")
+  cashier_session        CashierSession      @relation(fields: [cashier_session_id], references: [id])
+  amount                 Decimal
+  method                 PosPaymentMethod?
+  status                 PaymentIntentStatus @default(CREATED)
+  payment_reference_code String              @unique @map("payment_reference_code")
+  qr_code                String?
+  expires_at             DateTime            @map("expires_at")
+  customer_kp_id         String?             @map("customer_kp_id")
+  customer_phone         String?             @map("customer_phone")
+  description            String?
+  metadata               Json?
+  created_at             DateTime            @default(now()) @map("created_at")
+  updated_at             DateTime            @updatedAt @map("updated_at")
+
+  ledger_transactions    Transaction[]
+  payment_transactions   PaymentTransaction[]
+  audit_events           PosAuditEvent[]
+  refunds                RefundRequest[]
+
+  @@index([cashier_session_id])
+  @@index([cashier_id])
+  @@index([merchant_id])
+  @@index([status])
+  @@map("payment_intents")
+}
+
+model PosAuditEvent {
+  id                 String   @id @default(uuid())
+  payment_intent_id  String?  @map("payment_intent_id")
+  payment_intent     PaymentIntent? @relation(fields: [payment_intent_id], references: [id])
+  cashier_id         String?  @map("cashier_id")
+  cashier_session_id String?  @map("cashier_session_id")
+  merchant_id        String   @map("merchant_id")
+  actor_type         String   @map("actor_type")
+  actor_id           String   @map("actor_id")
+  action             String
+  metadata           Json?
+  created_at         DateTime @default(now()) @map("created_at")
+
+  @@index([payment_intent_id])
+  @@index([cashier_id])
+  @@index([merchant_id])
+  @@index([action])
+  @@map("pos_audit_events")
+}
+
+// ============================================
+// 🧾 REFUND ENGINE - MODELOS
+// ============================================
+
+model RefundRequest {
+  id                String         @id @default(uuid())
+  payment_intent_id String?        @map("payment_intent_id")
+  transaction_id    String         @map("transaction_id")
+  merchant_id       String         @map("merchant_id")
+  merchant_kp_id    String         @map("merchant_kp_id")
+  customer_kp_id    String         @map("customer_kp_id")
+  amount            Decimal
+  reason            String?
+  status            RefundStatus   @default(PENDING)
+  
+  requested_by      String         @map("requested_by")
+  requested_by_type String         @map("requested_by_type")
+  
+  approved_by       String?        @map("approved_by")
+  approved_at       DateTime?      @map("approved_at")
+  
+  processed_by      String?        @map("processed_by")
+  processed_at      DateTime?      @map("processed_at")
+  
+  reversal_transaction_id String?  @map("reversal_transaction_id")
+  
+  created_at        DateTime       @default(now())
+  updated_at        DateTime       @updatedAt
+
+  payment_intent    PaymentIntent? @relation(fields: [payment_intent_id], references: [id])
+  original_transaction Transaction @relation("OriginalTransaction", fields: [transaction_id], references: [id])
+  reversal_transaction Transaction? @relation("ReversalTransaction", fields: [reversal_transaction_id], references: [id])
+  merchant          MerchantProfile @relation(fields: [merchant_id], references: [account_id])
+  audit_events      RefundAuditEvent[]
+
+  @@index([payment_intent_id])
+  @@index([transaction_id])
+  @@index([merchant_id])
+  @@index([status])
+  @@index([customer_kp_id])
+  @@map("refund_requests")
+}
+
+model RefundAuditEvent {
+  id                String   @id @default(uuid())
+  refund_request_id String   @map("refund_request_id")
+  action            String
+  actor_id          String   @map("actor_id")
+  actor_type        String   @map("actor_type")
+  metadata          Json?
+  created_at        DateTime @default(now())
+
+  refund_request    RefundRequest @relation(fields: [refund_request_id], references: [id])
+
+  @@index([refund_request_id])
+  @@index([created_at])
+  @@map("refund_audit_events")
+}

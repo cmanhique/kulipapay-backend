@@ -1,0 +1,16 @@
+# SUBSTITUIR o enum TransactionStatus por este:
+
+enum TransactionStatus {
+  PENDING
+  HELD              // Saldo congelado
+  RESERVED
+  RECEIVER_PENDING   // Aguarda aceitação do destinatário
+  RECEIVER_ACCEPTED  // Destinatário aceitou, aguarda finalização do remetente
+  RECEIVER_REJECTED  // Destinatário rejeitou
+  SENDER_FINALIZED   // Remetente finalizou com PIN/OTP
+  SETTLED            // Transferência concluída
+  CONFIRMED
+  REJECTED
+  EXPIRED
+  REVERSED
+}

@@ -1,0 +1,598 @@
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+
+class ApiService {
+  // ============================================
+  // SINGLETON
+  // ============================================
+  static final ApiService instance = ApiService._internal();
+  ApiService._internal();
+
+  // ============================================
+  // PROPRIEDADES
+  // ============================================
+  final FlutterSecureStorage _storage = const FlutterSecureStorage();
+  final http.Client _client = http.Client();
+  String? _cachedToken;
+
+  // ============================================
+  // GETTERS
+  // ============================================
+  String? get token => _cachedToken;
+
+  // ============================================
+  // INIT
+  // ============================================
+  Future<void> init() async {
+    _cachedToken = await _storage.read(key: 'auth_token');
+    print('[ApiService] inicializado: ${_cachedToken != null ? "token OK" : "sem token"}');
+  }
+
+  // ============================================
+  // TOKEN
+  // ============================================
+  Future<void> setToken(String token) async {
+    _cachedToken = token;
+    await _storage.write(key: 'auth_token', value: token);
+  }
+
+  Future<void> clearToken() async {
+    _cachedToken = null;
+    await _storage.delete(key: 'auth_token');
+  }
+
+  // ============================================
+  // HEADERS
+  // ============================================
+  Future<Map<String, String>> _getHeaders() async {
+    return {
+      'Content-Type': 'application/json',
+      if (_cachedToken != null) 'Authorization': 'Bearer $_cachedToken',
+    };
+  }
+
+  // ============================================
+  // MÉTODOS GENÉRICOS
+  // ============================================
+  Future<dynamic> get(String path) async {
+    final headers = await _getHeaders();
+    final response = await _client.get(
+      Uri.parse('$baseUrl$path'),
+      headers: headers,
+    );
+    return _decode(response);
+  }
+
+  Future<dynamic> post(String path, Map<String, dynamic> body) async {
+    final headers = await _getHeaders();
+    final response = await _client.post(
+      Uri.parse('$baseUrl$path'),
+      headers: headers,
+      body: jsonEncode(body),
+    );
+    return _decode(response);
+  }
+
+  dynamic _decode(http.Response response) {
+    final data = jsonDecode(response.body);
+    if (response.statusCode >= 400) {
+      throw Exception(data);
+    }
+    return data;
+  }
+
+  // ============================================
+  // AUTH
+  // ============================================
+
+  Future<Map<String, dynamic>> register(
+    String email,
+    String phone,
+    String password, {
+    String name = '',
+    String country = 'MZ',
+    String accountType = 'INDIVIDUAL',
+    Map<String, dynamic> extraData = const {},
+  }) async {
+    final response = await _client.post(
+      Uri.parse('$baseUrl/auth/register'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({
+        'email': email,
+        'phone': phone,
+        'password': password,
+        'name': name,
+        'country': country,
+        'accountType': accountType,
+        ...extraData,
+      }),
+    );
+
+    if (response.statusCode == 200) {
+      final data = json.decode(response.body);
+      final token = data['accessToken'] ?? data['token'];
+      if (token != null) {
+        await setToken(token);
+      }
+      return data;
+    } else {
+      final error = json.decode(response.body);
+      throw Exception(error['message'] ?? 'Registration failed');
+    }
+  }
+
+  Future<Map<String, dynamic>> login(String identifier, String password) async {
+    print('[LOGIN] identifier=$identifier');
+    print('[LOGIN] url=$baseUrl/auth/login');
+
+    try {
+      final response = await _client.post(
+        Uri.parse('$baseUrl/auth/login'),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({
+          'identifier': identifier,
+          'password': password,
+        }),
+      );
+
+      print('[LOGIN] status=${response.statusCode}');
+      print('[LOGIN] body=${response.body}');
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        final token = data['accessToken'] ?? data['token'];
+
+        if (token != null) {
+          await setToken(token);
+        }
+
+        return data;
+      } else {
+        final error = json.decode(response.body);
+        throw Exception(error['message'] ?? 'Login failed');
+      }
+    } catch (e) {
+      print('[LOGIN] network_error=$e');
+      rethrow;
+    }
+  }
+
+  Future<Map<String, dynamic>> me() async {
+    final headers = await _getHeaders();
+    final response = await _client.get(
+      Uri.parse('$baseUrl/auth/me'),
+      headers: headers,
+    );
+    return _decode(response);
+  }
+
+  Future<void> logout() async {
+    try {
+      final headers = await _getHeaders();
+      await _client.post(
+        Uri.parse('$baseUrl/auth/logout'),
+        headers: headers,
+      );
+    } catch (_) {}
+    await clearToken();
+  }
+
+  // ============================================
+  // WALLET
+  // ============================================
+
+  Future<double> balance() async {
+    final headers = await _getHeaders();
+    final response = await _client.get(
+      Uri.parse('$baseUrl/wallet/balance'),
+      headers: headers,
+    );
+    final data = _decode(response);
+    return (data['balance'] ?? 0).toDouble();
+  }
+
+  Future<List<dynamic>> transactions() async {
+    final headers = await _getHeaders();
+    final response = await _client.get(
+      Uri.parse('$baseUrl/wallet/transactions'),
+      headers: headers,
+    );
+    final data = _decode(response);
+    return data['data'] ?? [];
+  }
+
+  Future<double> deposit(double amount) async {
+    final headers = await _getHeaders();
+    final response = await _client.post(
+      Uri.parse('$baseUrl/wallet/deposit'),
+      headers: headers,
+      body: json.encode({'amount': amount}),
+    );
+    final data = _decode(response);
+    return (data['balance'] ?? 0).toDouble();
+  }
+
+  Future<double> transfer(String toAccount, double amount) async {
+    final headers = await _getHeaders();
+    final response = await _client.post(
+      Uri.parse('$baseUrl/wallet/transfer'),
+      headers: headers,
+      body: json.encode({
+        'toAccount': toAccount,
+        'amount': amount,
+      }),
+    );
+    final data = _decode(response);
+    return (data['fromBalance'] ?? 0).toDouble();
+  }
+
+  // ============================================
+  // MERCHANT
+  // ============================================
+
+  Future<Map<String, dynamic>> merchantDashboard() async {
+    final headers = await _getHeaders();
+    final response = await _client.get(
+      Uri.parse('$baseUrl/merchant/dashboard'),
+      headers: headers,
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> merchantStats() async {
+    final headers = await _getHeaders();
+    final response = await _client.get(
+      Uri.parse('$baseUrl/merchant/stats'),
+      headers: headers,
+    );
+    return _decode(response);
+  }
+
+  // ============================================
+  // REGIONS
+  // ============================================
+
+  Future<Map<String, dynamic>> regions() async {
+    final headers = await _getHeaders();
+    final response = await _client.get(
+      Uri.parse('$baseUrl/regions/regions'),
+      headers: headers,
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> globalDashboard() async {
+    final headers = await _getHeaders();
+    final response = await _client.get(
+      Uri.parse('$baseUrl/regions/dashboard/global'),
+      headers: headers,
+    );
+    return _decode(response);
+  }
+
+  // ============================================
+  // ADMIN
+  // ============================================
+
+  Future<Map<String, dynamic>> getAdminStats() async {
+    final headers = await _getHeaders();
+    final response = await _client.get(
+      Uri.parse('$baseUrl/admin/stats'),
+      headers: headers,
+    );
+    return _decode(response);
+  }
+
+  // ============================================
+  // CASHIER
+  // ============================================
+
+  Future<Map<String, dynamic>> cashierLogin(Map<String, dynamic> body) async {
+    final response = await _client.post(
+      Uri.parse('$baseUrl/cashier/auth/login'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode(body),
+    );
+
+    if (response.statusCode == 200) {
+      final data = json.decode(response.body);
+      final token = data['accessToken'] ?? data['token'];
+      if (token != null) {
+        await setToken(token);
+      }
+      return data;
+    } else {
+      final error = json.decode(response.body);
+      throw Exception(error['error'] ?? 'Cashier login failed');
+    }
+  }
+
+  Future<Map<String, dynamic>> cashierDashboard() async {
+    final headers = await _getHeaders();
+    final response = await _client.get(
+      Uri.parse('$baseUrl/cashier/dashboard'),
+      headers: headers,
+    );
+    return _decode(response);
+  }
+
+  // ============================================
+  // KYC
+  // ============================================
+
+  Future<Map<String, dynamic>> submitKyc(Map<String, dynamic> data) async {
+    final headers = await _getHeaders();
+    final response = await _client.post(
+      Uri.parse('$baseUrl/kyc/submit'),
+      headers: headers,
+      body: json.encode(data),
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> getKycStatus() async {
+    final headers = await _getHeaders();
+    final response = await _client.get(
+      Uri.parse('$baseUrl/kyc/status'),
+      headers: headers,
+    );
+    return _decode(response);
+  }
+
+  // ============================================
+  // QR CODE
+  // ============================================
+
+  Future<Map<String, dynamic>> generateQRCode(double amount, String description) async {
+    final headers = await _getHeaders();
+    final response = await _client.post(
+      Uri.parse('$baseUrl/qr/generate'),
+      headers: headers,
+      body: json.encode({
+        'amount': amount,
+        'description': description,
+      }),
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> payWithQRCode(String qrCode) async {
+    final headers = await _getHeaders();
+    final response = await _client.post(
+      Uri.parse('$baseUrl/qr/pay'),
+      headers: headers,
+      body: json.encode({'qrCode': qrCode}),
+    );
+    return _decode(response);
+  }
+
+  // ============================================
+  // AGENT CASH
+  // ============================================
+
+  Future<Map<String, dynamic>> initiateCashIn({
+    required String customerPhone,
+    required double amount,
+    required String agentPin,
+  }) async {
+    final headers = await _getHeaders();
+    final response = await _client.post(
+      Uri.parse('$baseUrl/agent-cash/cash-in/init'),
+      headers: headers,
+      body: json.encode({
+        'customerPhone': customerPhone,
+        'amount': amount,
+        'agentPin': agentPin,
+      }),
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> confirmCashIn({
+    required String transactionRef,
+    required String customerPin,
+  }) async {
+    final headers = await _getHeaders();
+    final response = await _client.post(
+      Uri.parse('$baseUrl/agent-cash/cash-in/confirm'),
+      headers: headers,
+      body: json.encode({
+        'transactionRef': transactionRef,
+        'customerPin': customerPin,
+      }),
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> initiateCashOut({
+    required String customerPhone,
+    required double amount,
+    required String agentPin,
+  }) async {
+    final headers = await _getHeaders();
+    final response = await _client.post(
+      Uri.parse('$baseUrl/agent-cash/cash-out/init'),
+      headers: headers,
+      body: json.encode({
+        'customerPhone': customerPhone,
+        'amount': amount,
+        'agentPin': agentPin,
+      }),
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> confirmCashOut({
+    required String transactionRef,
+    required String customerPin,
+  }) async {
+    final headers = await _getHeaders();
+    final response = await _client.post(
+      Uri.parse('$baseUrl/agent-cash/cash-out/confirm'),
+      headers: headers,
+      body: json.encode({
+        'transactionRef': transactionRef,
+        'customerPin': customerPin,
+      }),
+    );
+    return _decode(response);
+  }
+
+  // ============================================
+  // v2 - 2FA e BOOTSTRAP
+  // ============================================
+
+  Future<Map<String, dynamic>> getBootstrap() async {
+    final response = await _client.get(
+      Uri.parse('$baseUrl/public/bootstrap'),
+      headers: {'Content-Type': 'application/json'},
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> loginV2(String identifier, String password) async {
+    print('[LOGIN V2] identifier=$identifier');
+
+    try {
+      final response = await _client.post(
+        Uri.parse('$baseUrl/auth/login'),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({
+          'identifier': identifier,
+          'password': password,
+        }),
+      );
+
+      final data = json.decode(response.body);
+
+      if (response.statusCode == 200) {
+        // Se precisar de 2FA
+        if (data['requiresTwoFactor'] == true) {
+          return {
+            'requiresTwoFactor': true,
+            'kp_id': data['kp_id'],
+            'message': data['message'] ?? 'Código OTP enviado',
+          };
+        }
+
+        // Se já tiver token
+        final token = data['accessToken'] ?? data['token'];
+        if (token != null) {
+          await setToken(token);
+          return {
+            'success': true,
+            'token': token,
+            'refreshToken': data['refreshToken'],
+            'account': data['account'],
+          };
+        }
+
+        return data;
+      } else {
+        throw Exception(data['message'] ?? 'Login failed');
+      }
+    } catch (e) {
+      print('[LOGIN V2] error=$e');
+      rethrow;
+    }
+  }
+
+  Future<Map<String, dynamic>> verifyOtpV2(String kpId, String code) async {
+    final response = await _client.post(
+      Uri.parse('$baseUrl/auth/otp/verify'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({
+        'kp_id': kpId,
+        'code': code,
+      }),
+    );
+
+    final data = json.decode(response.body);
+
+    if (response.statusCode == 200) {
+      final token = data['accessToken'] ?? data['token'];
+      if (token != null) {
+        await setToken(token);
+      }
+      return data;
+    } else {
+      throw Exception(data['message'] ?? 'OTP verification failed');
+    }
+  }
+
+  Future<Map<String, dynamic>> generateOtpV2(String identifier) async {
+    final response = await _client.post(
+      Uri.parse('$baseUrl/auth/otp/generate'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({'identifier': identifier}),
+    );
+    return _decode(response);
+  }
+
+  // ============================================
+  // PIN
+  // ============================================
+
+  Future<void> setPin(String pin) async {
+    final headers = await _getHeaders();
+    final response = await _client.post(
+      Uri.parse('$baseUrl/security/pin/set'),
+      headers: headers,
+      body: json.encode({'pin': pin}),
+    );
+    _decode(response);
+  }
+
+  Future<void> verifyPin(String pin) async {
+    final headers = await _getHeaders();
+    final response = await _client.post(
+      Uri.parse('$baseUrl/security/pin/verify'),
+      headers: headers,
+      body: json.encode({'pin': pin}),
+    );
+    _decode(response);
+  }
+
+  Future<bool> hasPin() async {
+    final headers = await _getHeaders();
+    final response = await _client.get(
+      Uri.parse('$baseUrl/security/pin/status'),
+      headers: headers,
+    );
+    final data = _decode(response);
+    return data['hasPin'] ?? false;
+  }
+
+  // ============================================
+  // PASSWORD RESET
+  // ============================================
+
+  Future<Map<String, dynamic>> requestPasswordReset(String identifier) async {
+    final response = await _client.post(
+      Uri.parse('$baseUrl/auth/forgot-password'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({'identifier': identifier}),
+    );
+    return _decode(response);
+  }
+
+  Future<Map<String, dynamic>> resetPassword(String token, String newPassword) async {
+    final response = await _client.post(
+      Uri.parse('$baseUrl/auth/reset-password'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({
+        'token': token,
+        'newPassword': newPassword,
+      }),
+    );
+    return _decode(response);
+  }
+
+  // ============================================
+  // DISPOSE
+  // ============================================
+  void dispose() {
+    _client.close();
+  }
+}

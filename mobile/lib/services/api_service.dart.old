@@ -1,0 +1,67 @@
+  // ============ ADMIN METHODS ============
+
+  Future<List<Map<String, dynamic>>> getChartData() async {
+    final headers = await _getHeaders();
+    
+    try {
+      final response = await _client.get(
+        Uri.parse('${AppConfig.apiUrl}/api/admin/chart-data'),
+        headers: headers,
+      );
+      
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return List<Map<String, dynamic>>.from(data['data'] ?? []);
+      } else {
+        // Dados mockados para desenvolvimento
+        return [
+          {'day': 'Seg', 'value': 1000},
+          {'day': 'Ter', 'value': 1500},
+          {'day': 'Qua', 'value': 2000},
+          {'day': 'Qui', 'value': 1800},
+          {'day': 'Sex', 'value': 2500},
+          {'day': 'Sab', 'value': 3000},
+          {'day': 'Dom', 'value': 2800},
+        ];
+      }
+    } catch (e) {
+      return [];
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> getAdminUsers() async {
+    final headers = await _getHeaders();
+    
+    try {
+      final response = await _client.get(
+        Uri.parse('${AppConfig.apiUrl}/api/admin/users'),
+        headers: headers,
+      );
+      
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return List<Map<String, dynamic>>.from(data['users'] ?? []);
+      } else {
+        return [];
+      }
+    } catch (e) {
+      return [];
+    }
+  }
+
+  Future<void> toggleBlockUser(String userId, bool block) async {
+    final headers = await _getHeaders();
+    
+    final response = await _client.post(
+      Uri.parse('${AppConfig.apiUrl}/api/admin/users/$userId/${block ? 'block' : 'unblock'}'),
+      headers: headers,
+    );
+    
+    if (response.statusCode != 200) {
+      throw Exception('Failed to toggle user status');
+    }
+  }
+
+  String formatMoney(double amount) {
+    return '${amount.toStringAsFixed(2)} MZN';
+  }

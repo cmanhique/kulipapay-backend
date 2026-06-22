@@ -1,0 +1,31 @@
+/**
+ * PAYMENT TYPES
+ * 
+ * Constantes e tipos para o Payment Core
+ */
+
+const PAYMENT_STATUS = {
+  PENDING: 'PENDING',
+  PROCESSING: 'PROCESSING',
+  SUCCEEDED: 'SUCCEEDED',
+  FAILED: 'FAILED',
+  CANCELLED: 'CANCELLED',
+  REFUNDED: 'REFUNDED'
+};
+
+const PAYMENT_TYPE = {
+  DEPOSIT: 'DEPOSIT',
+  WITHDRAWAL: 'WITHDRAWAL'
+};
+
+const PAYMENT_PROVIDER = {
+  MPESA: 'MPESA',
+  EMOLA: 'EMOLA',
+  MKESH: 'MKESH'
+};
+
+module.exports = {
+  PAYMENT_STATUS,
+  PAYMENT_TYPE,
+  PAYMENT_PROVIDER
+};

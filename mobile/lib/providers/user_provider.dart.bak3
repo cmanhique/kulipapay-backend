@@ -1,0 +1,103 @@
+import 'package:flutter/foundation.dart';
+import '../services/api_service.dart';
+
+class UserProvider extends ChangeNotifier {
+  final ApiService _api = ApiService.instance;
+
+  double _balance = 0.0;
+  List<dynamic> _transactions = [];
+
+  double get balance => _balance;
+  List<dynamic> get transactions => _transactions;
+
+  double _safeDouble(dynamic value) {
+    if (value == null) return 0.0;
+    if (value is num) return value.toDouble();
+    if (value is String) return double.tryParse(value) ?? 0.0;
+    return 0.0;
+  }
+
+  Future<void> loadBalance() async {
+    try {
+      final res = await _api.balance();
+
+      // aceita vários formatos de API
+      if (res is Map && res['balance'] != null) {
+        _balance = _safeDouble(res['balance']);
+      } else {
+        _balance = _safeDouble(res);
+      }
+
+      debugPrint('💰 BALANCE LOADED: $_balance');
+      notifyListeners();
+    } catch (e) {
+      debugPrint('❌ BALANCE ERROR: $e');
+    }
+  }
+
+  Future<void> loadTransactions() async {
+    try {
+      final res = await _api.transactions();
+
+      if (res is List) {
+        _transactions = res;
+      } else if (res is Map && res['data'] is List) {
+        _transactions = res['data'];
+      } else {
+        _transactions = [];
+      }
+
+      debugPrint('📊 TRANSACTIONS LOADED: ${_transactions.length}');
+      notifyListeners();
+    } catch (e) {
+      debugPrint('❌ TRANSACTIONS ERROR: $e');
+    }
+  }
+
+  Future<void> loadAll() async {
+    await Future.wait([
+      loadBalance(),
+      loadTransactions(),
+    ]);
+
+    debugPrint('✅ ALL LOADED');
+  }
+
+  Future<void> deposit(double amount) async {
+    try {
+      final res = await _api.deposit(amount);
+
+      _balance = _safeDouble(
+        res is Map ? res['balance'] : res,
+      );
+
+      await loadTransactions();
+      notifyListeners();
+    } catch (e) {
+      debugPrint('❌ DEPOSIT ERROR: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> transfer(String toAccount, double amount) async {
+    try {
+      final res = await _api.transfer(toAccount, amount);
+
+      _balance = _safeDouble(
+        res is Map ? res['balance'] : res,
+      );
+
+      await loadTransactions();
+      notifyListeners();
+    } catch (e) {
+      debugPrint('❌ TRANSFER ERROR: $e');
+      rethrow;
+    }
+  }
+
+  void clear() {
+    _balance = 0.0;
+    _transactions = [];
+    notifyListeners();
+  }
+}

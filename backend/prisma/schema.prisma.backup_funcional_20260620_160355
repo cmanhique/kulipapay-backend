@@ -1,0 +1,351 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =======================
+// ENUMS
+// =======================
+
+enum AccountType {
+  INDIVIDUAL
+  BUSINESS
+  MERCHANT
+  AGENT
+}
+
+enum TransactionStatus {
+  PENDING
+  HELD
+  RESERVED
+  SETTLED
+  CONFIRMED
+  REJECTED
+  EXPIRED
+  REVERSED
+}
+
+enum TransactionMode {
+  INSTANT
+  SECURE
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  BLOCKED
+}
+
+// =======================
+// ACCOUNT CORE
+// =======================
+
+model Account {
+  id            String      @id @default(uuid())
+  kp_id         String      @unique
+  email         String?     @unique
+  phone         String      @unique
+  name          String?
+  password_hash String
+  account_type  AccountType @default(INDIVIDUAL)
+  role          String      @default("USER")
+  status        String      @default("ACTIVE")
+  country       String      @default("MZ")
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  wallet          Wallet?
+  agent           Agent?
+  kyc             KycProfile?
+  sessions        Session[]
+  otp_codes       OtpCode[]
+  security_pin    SecurityPin?
+  risk_score      RiskScore?
+  fraud_alerts    FraudAlert[]
+  blocked_actions BlockedAction[]
+
+  ledger_entries TransactionLedger[]
+  payments       PaymentTransaction[]
+  audit_logs     AuditLog[]
+  snapshots      BalanceSnapshot[]
+
+  @@map("accounts")
+}
+
+// =======================
+// WALLET
+// =======================
+
+model Wallet {
+  id    String @id @default(uuid())
+  kp_id String @unique
+
+  balance           Decimal @default(0)
+  frozen_balance    Decimal @default(0)
+  available_balance Decimal @default(0)
+
+  version Int @default(1)
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("wallets")
+}
+
+// =======================
+// AGENT
+// =======================
+
+model Agent {
+  id            String  @id @default(uuid())
+  kp_id         String  @unique
+  business_name String
+  phone         String  @unique
+  email         String? @unique
+
+  float_balance   Decimal @default(0)
+  commission_rate Float   @default(0.01)
+
+  status String @default("ACTIVE")
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("agents")
+}
+
+// =======================
+// TRANSACTIONS
+// =======================
+
+model Transaction {
+  id            String @id @default(uuid())
+  transactionId String @unique
+
+  from_kp String
+  to_kp   String
+
+  amount Decimal
+  fee    Decimal @default(0)
+
+  status TransactionStatus @default(PENDING)
+  mode   TransactionMode   @default(SECURE)
+
+  expired_at DateTime? // FIX CRÍTICO PARA O TEU SERVICE
+
+  metadata Json?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@map("transactions")
+}
+
+// =======================
+// LEDGER
+// =======================
+
+model TransactionLedger {
+  id    String @id @default(uuid())
+  kp_id String
+
+  type           String
+  amount         Decimal
+  balance_before Decimal
+  balance_after  Decimal
+
+  reference String @unique
+  status    String
+
+  metadata Json?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("transaction_ledger")
+}
+
+// =======================
+// PAYMENTS
+// =======================
+
+model PaymentTransaction {
+  id    String @id @default(uuid())
+  kp_id String
+
+  type   String
+  amount Decimal
+  fee    Decimal @default(0)
+
+  status String @default("PENDING")
+  method String
+
+  reference String @unique
+
+  metadata Json?
+
+  settled_at DateTime?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("payment_transactions")
+}
+
+// =======================
+// KYC
+// =======================
+
+model KycProfile {
+  id    String @id @default(uuid())
+  kp_id String @unique
+
+  full_name   String
+  document_id String @unique
+  status      String @default("PENDING")
+
+  verified_at DateTime?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+}
+
+// =======================
+// SESSIONS
+// =======================
+
+model Session {
+  id         String   @id @default(uuid())
+  kp_id      String
+  token      String   @unique
+  expires_at DateTime
+
+  created_at DateTime @default(now())
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+}
+
+// =======================
+// OTP
+// =======================
+
+model OtpCode {
+  id         String   @id @default(uuid())
+  kp_id      String
+  code       String
+  expires_at DateTime
+  used       Boolean  @default(false)
+
+  created_at DateTime @default(now())
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+}
+
+// =======================
+// SECURITY PIN
+// =======================
+
+model SecurityPin {
+  id       String @id @default(uuid())
+  kp_id    String @unique
+  pin_hash String
+
+  created_at DateTime @default(now())
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+}
+
+// =======================
+// RISK SCORE
+// =======================
+
+model RiskScore {
+  id    String @id @default(uuid())
+  kp_id String @unique
+
+  score Int
+  level RiskLevel
+
+  updated_at DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+}
+
+// =======================
+// FRAUD ALERTS
+// =======================
+
+model FraudAlert {
+  id    String @id @default(uuid())
+  kp_id String
+
+  reason   String
+  severity String
+
+  created_at DateTime @default(now())
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+}
+
+// =======================
+// BLOCKED ACTIONS
+// =======================
+
+model BlockedAction {
+  id    String @id @default(uuid())
+  kp_id String
+
+  action String
+  reason String
+
+  created_at DateTime @default(now())
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+}
+
+// =======================
+// AUDIT LOG
+// =======================
+
+model AuditLog {
+  id    String @id @default(uuid())
+  kp_id String
+
+  action   String
+  metadata Json?
+
+  created_at DateTime @default(now())
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+}
+
+// =======================
+// BALANCE SNAPSHOT
+// =======================
+
+model BalanceSnapshot {
+  id    String @id @default(uuid())
+  kp_id String
+
+  balance Decimal
+
+  created_at DateTime @default(now())
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+}

@@ -1,0 +1,171 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+# =========================
+# ENUMS
+# =========================
+
+enum AccountType {
+  INDIVIDUAL
+  MERCHANT
+  BUSINESS
+}
+
+enum AccountStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  BLOCKED
+}
+
+enum Role {
+  USER
+  AGENT
+  ADMIN
+  SUPER_ADMIN
+}
+
+# =========================
+# ACCOUNT (CORE IDENTITY)
+# =========================
+
+model Account {
+  id            String   @id @default(uuid())
+  kp_id         String   @unique
+
+  email         String?  @unique
+  phone         String   @unique
+  name          String?
+
+  account_type  AccountType @default(INDIVIDUAL)
+  role          Role         @default(USER)
+  status        AccountStatus @default(ACTIVE)
+
+  country       String   @default("MZ")
+  is_agent      Boolean  @default(false)
+
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+  deleted_at    DateTime?
+
+  version       Int      @default(1)
+
+  # RELAÇÕES
+  security      AccountSecurity?
+  wallets       Wallet[]
+  audit_logs    AccountAuditLog[]
+
+  @@index([kp_id])
+  @@index([phone])
+  @@index([email])
+  @@index([status])
+}
+
+# =========================
+# SECURITY (PIN / PASSWORD)
+# =========================
+
+model AccountSecurity {
+  id             String @id @default(uuid())
+  account_kp_id  String @unique
+
+  password_hash  String
+  pin_hash       String?
+
+  pin_attempts   Int @default(0)
+  locked_until   DateTime?
+
+  twofa_enabled  Boolean @default(false)
+
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  account Account @relation(fields: [account_kp_id], references: [kp_id], onDelete: Cascade)
+}
+
+# =========================
+# WALLET (BALANCE REAL)
+# =========================
+
+model Wallet {
+  id             String @id @default(uuid())
+  account_kp_id  String
+
+  balance        Decimal @default(0) @db.Decimal(18,2)
+  currency       String  @default("MZN")
+
+  status         String  @default("ACTIVE")
+
+  version        Int @default(1)
+
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  account Account @relation(fields: [account_kp_id], references: [kp_id], onDelete: Restrict)
+
+  @@unique([account_kp_id, currency])
+  @@index([account_kp_id])
+}
+
+# =========================
+# AUDIT LOG
+# =========================
+
+model AccountAuditLog {
+  id             String @id @default(uuid())
+  account_kp_id  String
+
+  action         String
+  metadata       Json
+
+  ip_address     String?
+  device         String?
+
+  created_at     DateTime @default(now())
+
+  account Account @relation(fields: [account_kp_id], references: [kp_id], onDelete: Cascade)
+
+  @@index([account_kp_id])
+  @@index([action])
+}
+
+# =========================
+# LEDGER BASE (FUTURO)
+# =========================
+
+model LedgerAccount {
+  id        String @id @default(uuid())
+  code      String @unique
+  name      String
+  type      String
+
+  created_at DateTime @default(now())
+
+  journal_entries JournalEntry[]
+
+  @@index([code])
+}
+
+model JournalEntry {
+  id                String @id @default(uuid())
+
+  transaction_id    String
+  ledger_account_id String
+
+  entry_type        String
+  amount            Decimal @db.Decimal(18,2)
+  currency          String @default("MZN")
+
+  created_at        DateTime @default(now())
+
+  ledger_account LedgerAccount @relation(fields: [ledger_account_id], references: [id], onDelete: Restrict)
+
+  @@index([transaction_id])
+  @@index([ledger_account_id])
+}

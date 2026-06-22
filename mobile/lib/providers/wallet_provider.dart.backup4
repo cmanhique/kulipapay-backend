@@ -1,0 +1,169 @@
+import 'package:flutter/foundation.dart';
+import '../services/api_service.dart';
+
+// =========================
+// ESTADO (NOVO - NÃO QUEBRA)
+// =========================
+enum WalletStatus {
+  idle,
+  loading,
+  loaded,
+  error,
+}
+
+class WalletProvider extends ChangeNotifier {
+  final ApiService _api = ApiService.instance;
+
+  // DADOS (EXISTENTES)
+  double _balance = 0.0;
+  List<dynamic> _transactions = [];
+  bool _isLoading = false;
+
+  // ESTADO (NOVO)
+  WalletStatus _status = WalletStatus.idle;
+  String? _error;
+
+  // =========================
+  // GETTERS EXISTENTES
+  // =========================
+  double get balance => _balance;
+  List<dynamic> get transactions => _transactions;
+  bool get isLoading => _isLoading;
+
+  // =========================
+  // GETTERS NOVOS (NÃO QUEBRAM)
+  // =========================
+  WalletStatus get status => _status;
+  String? get error => _error;
+  bool get hasError => _status == WalletStatus.error;
+  bool get isLoaded => _status == WalletStatus.loaded;
+
+  // =========================
+  // MÉTODOS EXISTENTES (MANTIDOS)
+  // =========================
+  void _setLoading(bool value) {
+    _isLoading = value;
+    notifyListeners();
+  }
+
+  Future<void> loadBalance() async {
+    _setLoading(true);
+    _status = WalletStatus.loading;
+    _error = null;
+    notifyListeners();
+
+    try {
+      _balance = await _api.balance();
+      debugPrint('💰 BALANCE LOADED: $_balance');
+      _status = WalletStatus.loaded;
+    } catch (e) {
+      debugPrint('❌ BALANCE ERROR: $e');
+      _status = WalletStatus.error;
+      _error = e.toString();
+    } finally {
+      _setLoading(false);
+    }
+  }
+
+  Future<void> loadTransactions() async {
+    _setLoading(true);
+    _status = WalletStatus.loading;
+    _error = null;
+    notifyListeners();
+
+    try {
+      _transactions = await _api.transactions();
+      debugPrint('📊 TRANSACTIONS LOADED: ${_transactions.length}');
+      _status = WalletStatus.loaded;
+    } catch (e) {
+      debugPrint('❌ TRANSACTIONS ERROR: $e');
+      _status = WalletStatus.error;
+      _error = e.toString();
+    } finally {
+      _setLoading(false);
+    }
+  }
+
+  // =========================
+  // NOVO MÉTODO (CARREGA TUDO EM PARALELO)
+  // =========================
+  Future<void> loadAll() async {
+    _setLoading(true);
+    _status = WalletStatus.loading;
+    _error = null;
+    notifyListeners();
+
+    try {
+      final results = await Future.wait([
+        _api.balance(),
+        _api.transactions(),
+      ]);
+
+      _balance = results[0];
+      _transactions = results[1];
+
+      debugPrint('💰 BALANCE LOADED: $_balance');
+      debugPrint('📊 TRANSACTIONS LOADED: ${_transactions.length}');
+
+      _status = WalletStatus.loaded;
+    } catch (e) {
+      debugPrint('❌ LOAD ALL ERROR: $e');
+      _status = WalletStatus.error;
+      _error = e.toString();
+    } finally {
+      _setLoading(false);
+    }
+  }
+
+  // =========================
+  // MÉTODOS EXISTENTES (MANTIDOS)
+  // =========================
+  Future<void> deposit(double amount) async {
+    try {
+      _balance = await _api.deposit(amount);
+      debugPrint('💰 DEPOSIT OK: $_balance');
+      await loadTransactions();
+      notifyListeners();
+    } catch (e) {
+      debugPrint('❌ DEPOSIT ERROR: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> transfer(String toAccount, double amount) async {
+    try {
+      _balance = await _api.transfer(toAccount, amount);
+      debugPrint('💰 TRANSFER OK: $_balance');
+      await loadTransactions();
+      notifyListeners();
+    } catch (e) {
+      debugPrint('❌ TRANSFER ERROR: $e');
+      rethrow;
+    }
+  }
+
+  void clear() {
+    _balance = 0.0;
+    _transactions = [];
+    _isLoading = false;
+    _status = WalletStatus.idle;
+    _error = null;
+    notifyListeners();
+  }
+}
+
+  Future<void> loadAll() async {
+    try {
+      final results = await Future.wait([
+        _api.balance(),
+        _api.transactions(),
+      ]);
+      _balance = results[0] as double;
+      _transactions = results[1] as List<dynamic>;
+      debugPrint('💰 BALANCE LOADED: $_balance');
+      debugPrint('📊 TRANSACTIONS LOADED: ${_transactions.length}');
+      notifyListeners();
+    } catch (e) {
+      debugPrint('❌ LOAD ALL ERROR: $e');
+    }
+  }

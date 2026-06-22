@@ -1,0 +1,161 @@
+require('dotenv').config();
+
+// v1 - Legacy
+const authRoutes = require('./routes/auth.routes');
+const merchantRoutes = require('./routes/merchant.routes');
+const walletRoutes = require('./routes/wallet.routes');
+const cashierRoutes = require('./routes/cashier.routes');
+const regionRoutes = require('./routes/region.routes');
+const transactionRoutes = require('./routes/transaction.routes');
+const refundRoutes = require('./routes/refund.routes');
+const adminRoutes = require('./routes/admin/admin.routes');
+
+// Transferências seguras
+const secureTransferRoutes = require('./routes/secure-transfer.routes');
+
+// Transaction Domain
+const transactionDomainRoutes = require('./routes/transaction.domain.routes');
+
+// Escrow
+const escrowRoutes = require('./routes/escrow.routes');
+
+// v2 - Modular
+const authModuleRoutes = require('./modules/auth/auth.routes');
+const identityModuleRoutes = require('./modules/identity/identity.routes');
+const uiModuleRoutes = require('./modules/ui/ui.routes');
+const accessModuleRoutes = require('./modules/access/access.routes');
+const bootstrapModuleRoutes = require('./modules/bootstrap/bootstrap.routes');
+const policyModuleRoutes = require('./modules/policy/policy.routes');
+const policyAdminRoutes = require('./modules/policy/admin/policy.admin.routes');
+
+// SSE (Server-Sent Events)
+const websocketRoutes = require('./websocket/websocket.routes');
+
+const cors = require('@fastify/cors');
+const rateLimit = require('@fastify/rate-limit');
+
+console.log('🔥 APP.JS CARREGADO!');
+
+module.exports = async function (fastify) {
+  console.log('📌 A REGISTAR PLUGINS...');
+  
+  const { handleError } = require('./utils/errors');
+
+  fastify.setErrorHandler((error, request, reply) => {
+    handleError(error, reply);
+  });
+
+  fastify.register(cors, {
+    origin: true,
+    credentials: true
+  });
+
+  fastify.register(rateLimit, {
+    max: 100,
+    timeWindow: '1 minute',
+    allowList: [],
+    errorResponseBuilder: () => ({
+      success: false,
+      error: {
+        code: 'RATE_LIMIT',
+        message: 'Too many requests',
+        statusCode: 429
+      }
+    })
+  });
+
+  fastify.get('/health', async () => {
+    return {
+      status: 'ok',
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString()
+    };
+  });
+
+  console.log('📌 A REGISTAR ROTAS...');
+
+  // =========================
+  // ROTAS v1 (LEGACY) - CONTINUAM A FUNCIONAR
+  // =========================
+  await fastify.register(authRoutes, { prefix: '/api/auth' });
+  await fastify.register(merchantRoutes, { prefix: '/api/merchant' });
+  await fastify.register(walletRoutes, { prefix: '/api/wallet' });
+  await fastify.register(cashierRoutes, { prefix: '/api/cashier' });
+  await fastify.register(regionRoutes, { prefix: '/api/regions' });
+  await fastify.register(transactionRoutes, { prefix: '/api' });
+  await fastify.register(refundRoutes, { prefix: '/api' });
+  await fastify.register(adminRoutes, { prefix: '/api/admin' });
+
+  // =========================
+  // TRANSFERÊNCIAS SEGURAS
+  // =========================
+  await fastify.register(secureTransferRoutes, { prefix: '/api' });
+
+  // =========================
+  // TRANSACTION DOMAIN
+  // =========================
+  await fastify.register(transactionDomainRoutes, { prefix: '/api' });
+
+  // =========================
+  // ESCROW
+  // =========================
+  await fastify.register(escrowRoutes, { prefix: '/api' });
+
+  // =========================
+  // ROTAS v2 (MODULAR)
+  // =========================
+  await fastify.register(authModuleRoutes, { prefix: '/api/v2/auth' });
+  await fastify.register(identityModuleRoutes, { prefix: '/api/v2/identity' });
+  await fastify.register(uiModuleRoutes, { prefix: '/api/v2/ui' });
+  await fastify.register(accessModuleRoutes, { prefix: '/api/v2/access' });
+  await fastify.register(bootstrapModuleRoutes, { prefix: '/api/v2/bootstrap' });
+  await fastify.register(policyModuleRoutes, { prefix: '/api/v2/policy' });
+  await fastify.register(policyAdminRoutes, { prefix: '/api/v2/policy' });
+
+  // =========================
+  // SSE (Server-Sent Events)
+  // =========================
+  await fastify.register(websocketRoutes);
+
+  console.log('✅ Routes loaded successfully');
+  console.log('   🟢 v1 (legacy):');
+  console.log('   - /api/auth/*');
+  console.log('   - /api/merchant/*');
+  console.log('   - /api/wallet/*');
+  console.log('   - /api/cashier/*');
+  console.log('   - /api/regions/*');
+  console.log('   - /api/transfer');
+  console.log('   - /api/refund');
+  console.log('   - /api/admin/*');
+  console.log('   ');
+  console.log('   🟣 v2 (modular):');
+  console.log('   - /api/v2/auth/*');
+  console.log('   - /api/v2/identity/*');
+  console.log('   - /api/v2/ui/*');
+  console.log('   - /api/v2/access/*');
+  console.log('   - /api/v2/bootstrap');
+  console.log('   - /api/v2/policy/*');
+  console.log('   ');
+  console.log('   🔐 Transaction Domain:');
+  console.log('   - /api/transaction/*');
+  console.log('   ');
+  console.log('   🔐 Escrow:');
+  console.log('   - /api/escrow/*');
+  console.log('   ');
+  console.log('   🔌 WebSocket:');
+  console.log('   - ws://localhost:3000/ws');
+
+  fastify.setNotFoundHandler((request, reply) => {
+    reply.status(404).send({
+      success: false,
+      error: {
+        code: 'NOT_FOUND',
+        message: 'Route not found',
+        statusCode: 404
+      }
+    });
+  });
+
+  console.log('✅ APP.JS CONFIGURADO COM SUCESSO!');
+  return fastify;
+};

@@ -1,0 +1,321 @@
+/**
+ * PAYMENT CORE
+ */
+
+const { prisma } = require('../../prisma');
+const crypto = require('crypto');
+const ProviderFactory = require('./providers/provider.factory');
+
+// 🔥 STATUS QUE EXISTEM NO BANCO
+const PAYMENT_STATUS = {
+  PENDING: 'PENDING',
+  PROCESSING: 'PROCESSING',
+  SUCCESS: 'SUCCESS',        // 🔥 Usar SUCCESS (mapeado pelo provider)
+  COMPLETED: 'COMPLETED',    // 🔥 Alternativa
+  FAILED: 'FAILED',
+  CANCELLED: 'CANCELLED'
+};
+
+// Estados finais (não podem ser alterados)
+const FINAL_STATES = [PAYMENT_STATUS.SUCCESS, PAYMENT_STATUS.COMPLETED, PAYMENT_STATUS.FAILED, PAYMENT_STATUS.CANCELLED];
+
+class PaymentCore {
+
+  static async createIntent({
+    kp_id,
+    type,
+    provider,
+    phone,
+    amount,
+    idempotencyKey = null,
+    metadata = {}
+  }) {
+    console.log('📝 PaymentCore.createIntent:', { kp_id, type, provider, phone, amount, idempotencyKey });
+
+    this.validateInput({ kp_id, type, provider, phone, amount });
+
+    if (idempotencyKey) {
+      const existing = await prisma.paymentTransaction.findUnique({
+        where: { idempotency_key: idempotencyKey }
+      });
+      if (existing) {
+        console.log(`🔄 IDEMPOTÊNCIA: ${existing.transactionId} (${existing.status})`);
+        return { ...existing, _idempotent: true };
+      }
+    }
+
+    const account = await prisma.account.findUnique({
+      where: { kp_id }
+    });
+    if (!account) {
+      throw new Error('Account not found');
+    }
+
+    if (type === 'WITHDRAWAL') {
+      const wallet = await prisma.wallet.findUnique({
+        where: { kp_id }
+      });
+      if (!wallet || Number(wallet.balance) < amount) {
+        throw new Error('Insufficient balance');
+      }
+    }
+
+    const transaction = await prisma.paymentTransaction.create({
+      data: {
+        transactionId: crypto.randomUUID(),
+        kp_id,
+        provider,
+        type,
+        amount,
+        phone_number: phone,
+        provider_reference: `${provider}-${Date.now()}`,
+        status: PAYMENT_STATUS.PENDING,
+        idempotency_key: idempotencyKey || null,
+        metadata: {
+          ...metadata,
+          initiatedAt: new Date().toISOString()
+        }
+      }
+    });
+
+    console.log(`✅ Intenção criada: ${transaction.transactionId}`);
+
+    this.processProvider(transaction.transactionId).catch(error => {
+      console.error(`❌ Erro no processamento do provider: ${error.message}`);
+    });
+
+    return transaction;
+  }
+
+  static async processProvider(transactionId) {
+    console.log(`⚙️ Processando provider: ${transactionId}`);
+
+    const transaction = await prisma.paymentTransaction.findUnique({
+      where: { transactionId }
+    });
+
+    if (!transaction || FINAL_STATES.includes(transaction.status)) {
+      return transaction;
+    }
+
+    if (transaction.status === PAYMENT_STATUS.PENDING) {
+      await prisma.paymentTransaction.update({
+        where: { transactionId },
+        data: { status: PAYMENT_STATUS.PROCESSING }
+      });
+    }
+
+    try {
+      const provider = ProviderFactory.get(transaction.provider);
+      
+      let result;
+      if (transaction.type === 'DEPOSIT') {
+        result = await provider.createPayment({
+          phone: transaction.phone_number,
+          amount: Number(transaction.amount),
+          reference: transaction.transactionId
+        });
+      } else if (transaction.type === 'WITHDRAWAL') {
+        result = await provider.createPayout({
+          phone: transaction.phone_number,
+          amount: Number(transaction.amount),
+          reference: transaction.transactionId
+        });
+      }
+
+      await prisma.paymentTransaction.update({
+        where: { transactionId },
+        data: {
+          status: result.status === 'SUCCESS' ? PAYMENT_STATUS.PROCESSING : result.status,
+          provider_response: result.raw || {},
+          provider_reference: result.reference || undefined
+        }
+      });
+
+      console.log(`✅ Provider processado: ${transactionId} -> ${result.status}`);
+      
+      if (result.status === 'SUCCESS') {
+        console.log(`⏳ Aguardando webhook para confirmar: ${transactionId}`);
+      }
+
+      return result;
+
+    } catch (error) {
+      console.error(`❌ Erro no provider: ${error.message}`);
+      await prisma.paymentTransaction.update({
+        where: { transactionId },
+        data: { status: PAYMENT_STATUS.FAILED }
+      });
+      throw error;
+    }
+  }
+
+  static async confirmPayment(transactionId) {
+    console.log(`✅ Confirmando pagamento via webhook: ${transactionId}`);
+
+    const transaction = await prisma.paymentTransaction.findUnique({
+      where: { transactionId }
+    });
+
+    if (!transaction) {
+      throw new Error('Transaction not found');
+    }
+
+    if (FINAL_STATES.includes(transaction.status)) {
+      console.log(`⏭️ Transação já finalizada: ${transaction.status}`);
+      return transaction;
+    }
+
+    const LedgerEngine = require('../ledger.engine');
+    const WebSocketService = require('../websocket/websocket.service');
+    const AuditService = require('../audit/audit.service');
+
+    try {
+      let ledgerResult;
+      if (transaction.type === 'DEPOSIT') {
+        ledgerResult = await LedgerEngine.deposit({
+          kp_id: transaction.kp_id,
+          amount: Number(transaction.amount),
+          description: `Depósito ${transaction.provider} via webhook`
+        });
+      } else if (transaction.type === 'WITHDRAWAL') {
+        ledgerResult = await LedgerEngine.transfer({
+          fromKp: transaction.kp_id,
+          toKp: 'PLATFORM_PAYMENTS',
+          amount: Number(transaction.amount),
+          reference: transaction.provider_reference,
+          description: `Saque ${transaction.provider} via webhook`
+        });
+      }
+
+      const updated = await prisma.paymentTransaction.update({
+        where: { transactionId },
+        data: {
+          status: PAYMENT_STATUS.SUCCESS,
+          completed_at: new Date(),
+          ledger_entry_id: ledgerResult?.entry?.id || ledgerResult?.debitEntry?.id
+        }
+      });
+
+      WebSocketService.sendToUser(transaction.kp_id, {
+        type: `PAYMENT_${transaction.type}_CONFIRMED`,
+        data: {
+          transactionId: updated.transactionId,
+          amount: updated.amount,
+          provider: updated.provider,
+          status: updated.status,
+          message: transaction.type === 'DEPOSIT'
+            ? `💰 Depósito de ${updated.amount} MZN via ${updated.provider} confirmado!`
+            : `🏦 Saque de ${updated.amount} MZN para ${updated.provider} confirmado!`
+        }
+      });
+
+      await AuditService.logUserAction(transaction.kp_id, `${transaction.type}_CONFIRMED`, 'payment', {
+        transactionId: updated.transactionId,
+        amount: updated.amount,
+        provider: updated.provider,
+        status: updated.status
+      });
+
+      console.log(`✅ Pagamento confirmado: ${transactionId}`);
+      return updated;
+
+    } catch (error) {
+      console.error(`❌ Erro ao confirmar pagamento: ${error.message}`);
+      await prisma.paymentTransaction.update({
+        where: { transactionId },
+        data: { status: PAYMENT_STATUS.FAILED }
+      });
+      throw error;
+    }
+  }
+
+  static validateInput({ kp_id, type, provider, phone, amount }) {
+    if (!kp_id || !type || !provider || !phone || !amount) {
+      throw new Error('Missing required fields');
+    }
+    if (amount <= 0) {
+      throw new Error('Amount must be greater than 0');
+    }
+    if (!ProviderFactory.has(provider)) {
+      throw new Error(`Provider ${provider} not supported`);
+    }
+  }
+
+  static async getTransactions(kp_id, limit = 50) {
+    return prisma.paymentTransaction.findMany({
+      where: { kp_id },
+      orderBy: { created_at: 'desc' },
+      take: limit
+    });
+  }
+
+  static async getStatus(transactionId, kp_id) {
+    const transaction = await prisma.paymentTransaction.findUnique({
+      where: { transactionId }
+    });
+
+    if (!transaction || transaction.kp_id !== kp_id) {
+      throw new Error('Not found or unauthorized');
+    }
+
+    return transaction;
+  }
+
+  static async handleWebhook(provider, payload) {
+    const WebhookVerifier = require('./webhook.verifier');
+    const normalized = WebhookVerifier.normalize(payload, provider);
+
+    const transaction = await prisma.paymentTransaction.findFirst({
+      where: {
+        OR: [
+          { provider_reference: normalized.reference },
+          { transactionId: normalized.reference }
+        ],
+        provider: provider
+      }
+    });
+
+    if (!transaction) {
+      throw new Error(`Transaction not found for reference: ${normalized.reference}`);
+    }
+
+    if (FINAL_STATES.includes(transaction.status)) {
+      return {
+        success: true,
+        transactionId: transaction.transactionId,
+        status: transaction.status,
+        _ignored: true
+      };
+    }
+
+    if (normalized.status === 'SUCCESS' || normalized.status === 'COMPLETED') {
+      return await this.confirmPayment(transaction.transactionId);
+    } else {
+      await prisma.paymentTransaction.update({
+        where: { transactionId: transaction.transactionId },
+        data: { status: PAYMENT_STATUS.FAILED }
+      });
+      return {
+        success: false,
+        transactionId: transaction.transactionId,
+        status: PAYMENT_STATUS.FAILED
+      };
+    }
+  }
+
+  static async execute({ kp_id, type, provider, phone, amount, idempotencyKey = null, metadata = {} }) {
+    console.log('⚠️ PaymentCore.execute() é deprecated. Usar createIntent()');
+    return this.createIntent({
+      kp_id,
+      type,
+      provider: provider.toUpperCase ? provider.toUpperCase() : provider,
+      phone,
+      amount,
+      idempotencyKey,
+      metadata
+    });
+  }
+}
+
+module.exports = PaymentCore;

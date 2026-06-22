@@ -1,0 +1,707 @@
+const fastify = require('fastify');
+const cors = require('@fastify/cors');
+const rateLimit = require('@fastify/rate-limit');
+const bcrypt = require('bcrypt');
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const { PrismaClient } = require('@prisma/client');
+const orchestrator = require('./orchestrators/transaction.orchestrator');
+const securityService = require('./services/security.service');
+
+const app = fastify({ logger: true });
+const prisma = new PrismaClient();
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+
+// Security plugins
+app.register(cors, { origin: true });
+app.register(rateLimit, { 
+  max: 100, 
+  timeWindow: '1 minute', 
+  keyGenerator: (req) => req.ip,
+  skip: (req) => req.url === '/health'
+});
+
+// Health
+app.get('/health', async () => ({ 
+  status: 'ok', 
+  version: '4.0.0', 
+  ledger: 'active', 
+  engine: 'LedgerEngine',
+  security: 'JWT + Refresh Tokens'
+}));
+
+// Register
+app.post('/api/auth/register', async (request, reply) => {
+  try {
+    const { email, phone, password, name, country = 'MZ' } = request.body;
+    
+    if (!phone || !password) return reply.status(400).send({ error: 'PHONE_AND_PASSWORD_REQUIRED' });
+    
+    const passwordValidation = securityService.validatePassword(password);
+    if (!passwordValidation.valid) {
+      return reply.status(400).send({ error: passwordValidation.error });
+    }
+    
+    const random = Math.floor(Math.random() * 100000000).toString().padStart(8, '0');
+    const kpId = `${country}-${random}-1`;
+    const hashedPassword = await bcrypt.hash(password, 12);
+    
+    const account = await prisma.account.create({
+      data: { 
+        kp_id: kpId, 
+        email: email || null, 
+        phone, 
+        name: name || null,
+        password_hash: hashedPassword, 
+        account_type: 'INDIVIDUAL', 
+        status: 'ACTIVE', 
+        country 
+      }
+    });
+    
+    await prisma.wallet.create({ data: { kp_id: kpId, balance: 0 } });
+    
+    const { accessToken, refreshToken, accessExpiresIn, refreshExpiresIn } = securityService.generateTokens(kpId);
+    
+    await prisma.session.create({
+      data: {
+        kp_id: kpId,
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        expires_at: new Date(Date.now() + accessExpiresIn * 1000),
+        refresh_expires_at: new Date(Date.now() + refreshExpiresIn * 1000)
+      }
+    });
+    
+    securityService.logSecurityEvent('USER_REGISTERED', { kpId, phone });
+    
+    return reply.send({ 
+      success: true, 
+      kpId, 
+      name: account.name,
+      accessToken,
+      refreshToken,
+      expiresIn: accessExpiresIn
+    });
+  } catch (error) {
+    if (error.code === 'P2002') return reply.status(400).send({ error: 'ACCOUNT_ALREADY_EXISTS' });
+    securityService.logSecurityEvent('REGISTER_ERROR', { error: error.message });
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+// Login
+app.post('/api/auth/login', async (request, reply) => {
+  try {
+    const { identifier, password } = request.body;
+    const isEmail = identifier.includes('@');
+    const account = await prisma.account.findFirst({ 
+      where: isEmail ? { email: identifier } : { phone: identifier } 
+    });
+    
+    if (!account) return reply.status(401).send({ error: 'INVALID_CREDENTIALS' });
+    
+    const valid = await bcrypt.compare(password, account.password_hash);
+    if (!valid) return reply.status(401).send({ error: 'INVALID_CREDENTIALS' });
+    
+    const { accessToken, refreshToken, accessExpiresIn, refreshExpiresIn } = securityService.generateTokens(account.kp_id);
+    
+    await prisma.session.deleteMany({ where: { kp_id: account.kp_id } });
+    await prisma.session.create({
+      data: {
+        kp_id: account.kp_id,
+        access_token: accessToken,
+        refresh_token: refreshTok        expires_at: new Date(Date.now() + accessExpiresIn * 1000),
+        refresh_expires_at: new Date(Date.now() + refreshExpiresIn * 1000)
+      }
+    });
+    
+    securityService.logSecurityEvent('USER_LOGIN', { kpId: account.kp_id });
+    
+    return reply.send({ 
+      success: true, 
+      accessToken,
+      refreshToken,
+      expiresIn: accessExpiresIn,
+      kpId: account.kp_id,
+      name: account.name,
+      phone: account.phone
+    });
+  } catch (error) {
+    securityService.logSecurityEvent('LOGIN_ERROR', { error: error.message });
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+// Refresh token
+app.post('/api/auth/refresh', async (request, reply) => {
+  try {
+    const { refreshToken } = request.body;
+    if (!refreshToken) return reply.status(400).send({ error: 'REFRESH_TOKEN_REQUIRED' });
+    
+    const session = await prisma.session.findUnique({ where: { refresh_token: refreshToken } });
+    if (!session || session.refresh_expires_at < new Date()) {
+      return reply.status(401).send({ error: 'INVALID_OR_EXPIRED_REFRESH_TOKEN' });
+    }
+    
+    const { accessToken, refreshToken: newRefreshToken, accessExpiresIn, refreshExpiresIn } = securityService.generateTokens(session.kp_id);
+    
+    await prisma.session.update({
+      where: { id: session.id },
+      data: {
+        access_token: accessToken,
+        refresh_token: newRefreshToken,
+        expires_at: new Date(Date.now() + accessExpiresIn * 1000),
+        refresh_expires_at: new Date(Date.now() + refreshExpiresIn * 1000)
+      }
+    });
+    
+    return reply.send({ accessToken, refreshToken: newRefreshToken, expiresIn: accessExpiresIn });
+  } catch (error) {
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+// Auth middleware
+async function authenticate(request, reply) {
+  try {
+    const auth = request.headers.authorization;
+    if (!auth) return reply.status(401).send({ error: 'NO_TOKEN_PROVIDED' });
+    
+    const token = auth.replace('Bearer ', '');
+    const session = await prisma.session.findUnique({ where: { access_token: token } });
+    
+    if (!session || session.expires_at < new Date()) {
+      return reply.status(401).send({ error: 'INVALID_OR_EXPIRED_TOKEN' });
+    }
+    
+    // Buscar dados do usuário
+    const account = await prisma.account.findUnique({ 
+      where: { kp_id: session.kp_id },
+      select: { kp_id: true, name: true, phone: true, email: true }
+    });
+    
+    request.user = { 
+      kpId: session.kp_id,
+      name: account?.name,
+      phone: account?.phone,
+      email: account?.email
+    };
+  } catch (err) {
+    return reply.status(401).send({ error: 'INVALID_TOKEN' });
+  }
+}
+
+// Logout
+app.post('/api/auth/logout', { preHandler: authenticate }, async (request, reply) => {
+  const auth = request.headers.authorization?.replace('Bearer ', '');
+  if (auth) await prisma.session.deleteMany({ where: { access_token: auth } });
+  securityService.logSecurityEvent('USER_LOGOUT', { kpId: request.user?.kpId });
+  return reply.send({ success: true });
+});
+
+// Me
+app.get('/api/auth/me', { preHandler: authenticate }, async (request, reply) => {
+  const { kpId } = request.user;
+  const account = await prisma.account.findUnique({ 
+    where: { kp_id: kpId }, 
+    include: { wallet: true } 
+  });
+  const maskedAccount = securityService.maskSensitiveData(account);
+  return reply.send(maskedAccount);
+});
+
+// Balance
+app.get('/api/wallet/balance', { preHandler: authenticate }, async (request, reply) => {
+  const { kpId } = request.user;
+  const balance = await orchestrator.getBalance(kpId);
+  return reply.send({ balance, source: 'ledger' });
+});
+
+// Deposit
+app.post('/api/wallet/deposit', { preHandler: authenticate }, async (request, reply) => {
+  const { kpId } = request.user;
+  const { amount, description } = request.body;
+  if (!amount || amount <= 0) return reply.status(400).send({ error: 'INVALID_AMOUNT' });
+  
+  const reference = `dep_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  try {
+    const result = await orchestrator.deposit({ toAccount: kpId, amount, reference, description });
+    securityService.logSecurityEvent('DEPOSIT', { kpId, amount });
+    return reply.send({ success: true, balance: result.fromBalance, transactionId: result.transactionId });
+  } catch (error) {
+    return reply.status(400).send({ error: error.message });
+  }
+});
+
+// Transfer
+app.post('/api/wallet/transfer', { preHandler: authenticate }, async (request, reply) => {
+  const { kpId: fromAccount, name: fromName } = request.user;
+  const { toAccount, amount, description } = request.body;
+  if (!toAccount) return reply.status(400).send({ error: 'DESTINATION_REQUIRED' });
+  if (!amount || amount <= 0) return reply.status(400).send({ error: 'INVALID_AMOUNT' });
+  
+  // Buscar dados do destinatário
+  const destination = await prisma.account.findUnique({ 
+    where: { kp_id: toAccount },
+    select: { name: true, phone: true }
+  });
+  
+  if (!destination) return reply.status(404).send({ error: 'DESTINATION_NOT_FOUND' });
+  
+  const reference = `tx_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  try {
+    const result = await orchestrator.transfer({ fromAccount, toAccount, amount, reference, description });
+    securityService.logSecurityEvent('TRANSFER', { fromAccount, toAccount, amount });
+    return reply.send({ 
+      success: true, 
+      balance: result.fromBalance, 
+      transactionId: result.transactionId, 
+      hash: result.hash,
+      toName: destination.name,
+      toPhone: destination.phone
+    });
+  } catch (error) {
+    const status = error.message === 'INSUFFICIENT_BALANCE' ? 400 : 404;
+    return reply.status(status).send({ error: error.message });
+  }
+});
+
+// History
+app.get('/api/wallet/transactions', { preHandler: authenticate }, async (request, reply) => {
+  const { kpId } = request.user;
+  const history = await orchestrator.getHistory(kpId);
+  
+  // Enriquecer com nomes dos participantes
+  const enrichedHistory = await Promise.all(history.map(async (entry) => {
+    let counterpartyName = null;
+    let counterpartyKpId = null;
+    
+    if (entry.from === kpId) {
+      counterpartyKpId = entry.to;
+    } else {
+      counterpartyKpId = entry.from;
+    }
+    
+    const counterparty = await prisma.account.findUnique({
+      where: { kp_id: counterpartyKpId },
+      select: { name: true, phone: true }
+    });
+    
+    return {
+      ...entry,
+      counterpartyName: counterparty?.name || counterpartyKpId,
+      counterpartyPhone: counterparty?.phone
+    };
+  }));
+  
+  return reply.send({ transactions: enrichedHistory });
+});
+
+// Admin
+app.get('/api/admin/ledger/verify', async (request, reply) => {
+  const result = await orchestrator.verifySystemIntegrity();
+  return reply.send(result);
+});
+
+// QR Code - Gerar (com dados do usuário)
+app.post('/api/qr/generate', { preHandler: authenticate }, async (request, reply) => {
+  const { kpId, name, phone } = request.user;
+  const { amount, description } = request.body;
+  if (!amount || amount <= 0) return reply.status(400).send({ error: 'INVALID_AMOUNT' });
+  
+  // Buscar dados completos do usuário
+  const account = await prisma.account.findUnique({
+    where: { kp_id: kpId },
+    select: { name: true, phone: true, email: true }
+  });
+  
+  // QR Code com dados do destinatário (para o pagador ver antes de pagar)
+  const qrPayload = {
+    type: 'PAYMENT',
+    to: kpId,
+    toName: account?.name || 'Usuário',
+    toPhone: account?.phone,
+    toEmail: account?.email,
+    amount: amount,
+    description: description || 'Pagamento via QR Code',
+    timestamp: Date.now(),
+    expiresIn: 300000 // 5 minutos
+  };
+  
+  const qrToken = jwt.sign(qrPayload, JWT_SECRET, { expiresIn: '5m' });
+  
+  return reply.send({ 
+    success: true, 
+    qrCode: qrToken, 
+    amount, 
+    expiresIn: 300,
+    recipient: {
+      name: account?.name,
+      phone: account?.phone,
+      kpId: kpId
+    }
+  });
+});
+
+// QR Code - Pagar (mostra confirmação com dados do destinatário)
+app.post('/api/qr/pay', { preHandler: authenticate }, async (request, reply) => {
+  const { kpId: payerKpId, name: payerName } = request.user;
+  const { qrCode } = request.body;
+  if (!qrCode) return reply.status(400).send({ error: 'QR_CODE_REQUIRED' });
+  
+  try {
+    const payload = jwt.verify(qrCode, JWT_SECRET);
+    
+    if (payload.type !== 'PAYMENT') {
+      return reply.status(400).send({ error: 'INVALID_QR_CODE' });
+    }
+    
+    if (payload.to === payerKpId) {
+      return reply.status(400).send({ error: 'CANNOT_PAY_YOURSELF' });
+    }
+    
+    if ((Date.now() - payload.timestamp) > payload.expiresIn) {
+      return reply.status(400).send({ error: 'QR_CODE_EXPIRED' });
+    }
+    
+    // Antes de processar o pagamento, mostrar confirmação com dados do destinatário
+    // O app deve mostrar uma tela de confirmação com estas informações
+    return reply.send({
+      requiresConfirmation: true,
+      paymentDetails: {
+        to: payload.to,
+        toName: payload.toName || 'Usuário',
+        toPhone: payload.toPhone,
+        toEmail: payload.toEmail,
+        amount: payload.amount,
+        description: payload.description,
+        expiresIn: Math.floor((payload.expiresIn - (Date.now() - payload.timestamp)) / 1000)
+      }
+    });
+    
+  } catch (error) {
+    if (error.name === 'TokenExpiredError') {
+      return reply.status(400).send({ error: 'QR_CODE_EXPIRED' });
+    }
+    if (error.name === 'JsonWebTokenError') {
+      return reply.status(400).send({ error: 'INVALID_QR_CODE' });
+    }
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+// QR Code - Confirmar pagamento (após usuário confirmar)
+app.post('/api/qr/confirm', { preHandler: authenticate }, async (request, reply) => {
+  const { kpId: payerKpId } = request.user;
+  const { qrCode, confirmed } = request.body;
+  
+  if (!confirmed) {
+    return reply.status(400).send({ error: 'PAYMENT_NOT_CONFIRMED' });
+  }
+  
+  if (!qrCode) return reply.status(400).send({ error: 'QR_CODE_REQUIRED' });
+  
+  try {
+    const payload = jwt.verify(qrCode, JWT_SECRET);
+    
+    if (payload.type !== 'PAYMENT') {
+      return reply.status(400).send({ error: 'INVALID_QR_CODE' });
+    }
+    
+    if (payload.to === payerKpId) {
+      return reply.status(400).send({ error: 'CANNOT_PAY_YOURSELF' });
+    }
+    
+    if ((Date.now() - payload.timestamp) > payload.expiresIn) {
+      return reply.status(400).send({ error: 'QR_CODE_EXPIRED' });
+    }
+    
+    const reference = `qr_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    const result = await orchestrator.transfer({ 
+      fromAccount: payerKpId, 
+      toAccount: payload.to, 
+      amount: payload.amount, 
+      reference, 
+      description: payload.description 
+    });
+    
+    securityService.logSecurityEvent('QR_PAYMENT', { 
+      fromAccount: payerKpId, 
+      toAccount: payload.to, 
+      amount: payload.amount,
+      toName: payload.toName
+    });
+    
+    return reply.send({ 
+      success: true, 
+      amount: payload.amount, 
+      to: payload.to,
+      toName: payload.toName,
+      description: payload.description, 
+      newBalance: result.fromBalance 
+    });
+    
+  } catch (error) {
+    if (error.name === 'TokenExpiredError') {
+      return reply.status(400).send({ error: 'QR_CODE_EXPIRED' });
+    }
+    if (error.name === 'JsonWebTokenError') {
+      return reply.status(400).send({ error: 'INVALID_QR_CODE' });
+    }
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+// Start
+const start = async () => {
+  try {
+    // Atualizar schema para incluir nome do usuário
+    await prisma.$executeRaw`
+      ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "name" TEXT;
+    `;
+    
+    await app.listen({ port: 3000, host: '0.0.0.0' });
+    console.log('\n🏦 KulipaPay - Production Ready');
+    console.log('===============================');
+    console.log('📡 http://localhost:3000');
+    console.log('❤️  http://localhost:3000/health\n');
+    console.log('🔒 Security Features:');
+    console.log('   ✓ JWT with Refresh Tokens');
+    console.log('   ✓ Rate Limiting (100 req/min)');
+    console.log('   ✓ QR Code with Recipient Verification');
+    console.log('   ✓ Transaction Confirmation');
+    console.log('   ✓ Security Logging\n');
+  } catch (err) {
+    console.error(err);
+    process.exit(1);
+  }
+};
+
+start();
+
+// ============ RECUPERAÇÃO DE SENHA ============
+
+const passwordRecovery = require('./services/password-recovery.service');
+
+// Solicitar recuperação
+app.post('/api/auth/forgot-password', async (request, reply) => {
+  try {
+    const { identifier } = request.body;
+    
+    if (!identifier) {
+      return reply.status(400).send({ error: 'IDENTIFIER_REQUIRED' });
+    }
+    
+    const result = await passwordRecovery.requestRecovery(identifier);
+    return reply.send(result);
+    
+  } catch (error) {
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+// Verificar token
+app.post('/api/auth/verify-reset-token', async (request, reply) => {
+  try {
+    const { token } = request.body;
+    
+    if (!token) {
+      return reply.status(400).send({ error: 'TOKEN_REQUIRED' });
+    }
+    
+    const result = await passwordRecovery.verifyToken(token);
+    return reply.send(result);
+    
+  } catch (error) {
+    const status = error.message === 'INVALID_TOKEN' || 
+                   error.message === 'TOKEN_EXPIRED' ? 400 : 500;
+    return reply.status(status).send({ error: error.message });
+  }
+});
+
+// Redefinir senha
+app.post('/api/auth/reset-password', async (request, reply) => {
+  try {
+    const { token, newPassword } = request.body;
+    
+    if (!token || !newPassword) {
+      return reply.status(400).send({ error: 'TOKEN_AND_PASSWORD_REQUIRED' });
+    }
+    
+    const result = await passwordRecovery.resetPassword(token, newPassword);
+    return reply.send(result);
+    
+  } catch (error) {
+    const status = error.message === 'INVALID_TOKEN' || 
+                   error.message === 'TOKEN_EXPIRED' ||
+                   error.message === 'PASSWORD_TOO_SHORT' ? 400 : 500;
+    return reply.status(status).send({ error: error.message });
+  }
+});
+
+// ============ RECUPERAÇÃO DE SENHA ============
+
+
+// Modelo temporário para tokens (enquanto não fazemos migration)
+const resetTokens = new Map();
+
+// Solicitar recuperação
+app.post('/api/auth/forgot-password', async (request, reply) => {
+  try {
+    const { identifier } = request.body;
+    
+    if (!identifier) {
+      return reply.status(400).send({ error: 'IDENTIFIER_REQUIRED' });
+    }
+    
+    const isEmail = identifier.includes('@');
+    const account = await prisma.account.findFirst({
+      where: isEmail ? { email: identifier } : { phone: identifier }
+    });
+    
+    if (!account) {
+      // Por segurança, não revelar se o utilizador existe
+      return reply.send({ 
+        success: true, 
+        message: 'Se a conta existir, receberá um código de recuperação' 
+      });
+    }
+    
+    // Gerar token de 6 dígitos
+    const token = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = Date.now() + 15 * 60 * 1000; // 15 minutos
+    
+    // Guardar token
+    resetTokens.set(token, {
+      kpId: account.kp_id,
+      expiresAt: expiresAt,
+      used: false
+    });
+    
+    // Em desenvolvimento, mostrar o token no console
+    console.log('\n========================================');
+    console.log('🔐 CÓDIGO DE RECUPERAÇÃO');
+    console.log(`📧 Conta: ${account.email || account.phone}`);
+    console.log(`🔑 Código: ${token}`);
+    console.log(`⏰ Expira em: 15 minutos`);
+    console.log('========================================\n');
+    
+    return reply.send({ 
+      success: true, 
+      message: 'Código de recuperação enviado',
+      // Em desenvolvimento, enviar o token para facilitar testes
+      ...(process.env.NODE_ENV !== 'production' && { token })
+    });
+    
+  } catch (error) {
+    console.error(error);
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+// Verificar token
+app.post('/api/auth/verify-reset-token', async (request, reply) => {
+  try {
+    const { token } = request.body;
+    
+    if (!token) {
+      return reply.status(400).send({ error: 'TOKEN_REQUIRED' });
+    }
+    
+    const resetToken = resetTokens.get(token);
+    
+    if (!resetToken) {
+      return reply.status(400).send({ error: 'INVALID_TOKEN' });
+    }
+    
+    if (resetToken.used) {
+      return reply.status(400).send({ error: 'TOKEN_ALREADY_USED' });
+    }
+    
+    if (Date.now() > resetToken.expiresAt) {
+      resetTokens.delete(token);
+      return reply.status(400).send({ error: 'TOKEN_EXPIRED' });
+    }
+    
+    return reply.send({ 
+      valid: true, 
+      kpId: resetToken.kpId 
+    });
+    
+  } catch (error) {
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+// Redefinir senha
+app.post('/api/auth/reset-password', async (request, reply) => {
+  try {
+    const { token, newPassword } = request.body;
+    
+    if (!token || !newPassword) {
+      return reply.status(400).send({ error: 'TOKEN_AND_PASSWORD_REQUIRED' });
+    }
+    
+    if (newPassword.length < 6) {
+      return reply.status(400).send({ error: 'PASSWORD_TOO_SHORT' });
+    }
+    
+    const resetToken = resetTokens.get(token);
+    
+    if (!resetToken) {
+      return reply.status(400).send({ error: 'INVALID_TOKEN' });
+    }
+    
+    if (resetToken.used) {
+      return reply.status(400).send({ error: 'TOKEN_ALREADY_USED' });
+    }
+    
+    if (Date.now() > resetToken.expiresAt) {
+      resetTokens.delete(token);
+      return reply.status(400).send({ error: 'TOKEN_EXPIRED' });
+    }
+    
+    // Hash da nova senha
+    const hashedPassword = await bcrypt.hash(newPassword, 12);
+    
+    // Atualizar senha
+    await prisma.account.update({
+      where: { kp_id: resetToken.kpId },
+      data: { password_hash: hashedPassword }
+    });
+    
+    // Marcar token como usado
+    resetToken.used = true;
+    resetTokens.set(token, resetToken);
+    
+    // Limpar token após 5 minutos
+    setTimeout(() => {
+      resetTokens.delete(token);
+    }, 5 * 60 * 1000);
+    
+    // Invalidar todas as sessões
+    await prisma.session.deleteMany({
+      where: { kp_id: resetToken.kpId }
+    });
+    
+    console.log(`✅ Senha redefinida para conta: ${resetToken.kpId}`);
+    
+    return reply.send({ 
+      success: true, 
+      message: 'Senha redefinida com sucesso' 
+    });
+    
+  } catch (error) {
+    console.error(error);
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+// Atualizar o login para incluir role no token
+// No endpoint de login, adicionar:
+// const token = jwt.sign({ kpId: account.kp_id, role: account.role }, SECRET, { expiresIn: '7d' });
+
+// ============ ADMIN ROUTES ============
+const adminRoutes = require('./routes/admin.routes');
+adminRoutes(app);

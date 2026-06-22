@@ -1,0 +1,616 @@
+/**
+ * TRANSACTION ENGINE
+ * 
+ * 🎯 Orquestrador de transações com dois modos:
+ * 1. INSTANT - Transferência imediata (confirmada automaticamente)
+ * 2. SECURE - Transferência segura (aguarda confirmação do destinatário)
+ * 
+ * 🔐 NOVO: Congelamento de saldo em transações SECURE
+ */
+
+const { prisma } = require('../../prisma');
+const LedgerEngine = require('../ledger.engine');
+const FeeEngine = require('../fee.engine');
+const LimitsEngine = require('../limits.engine');
+const IdempotencyEngine = require('./idempotency.engine');
+const AuditService = require('../audit/audit.service');
+const WebSocketService = require('../websocket/websocket.service');
+const FrozenBalanceService = require('../../services/frozen-balance.service');
+
+class TransactionEngine {
+  
+  static async executeTransfer({ 
+    from, 
+    to, 
+    amount, 
+    idempotencyKey, 
+    req = null, 
+    description = null,
+    mode = 'SECURE'
+  }) {
+    this.validateInput({ from, to, amount });
+    
+    const toAccount = await prisma.account.findUnique({
+      where: { kp_id: to }
+    });
+    
+    if (!toAccount) {
+      throw new Error(`Recipient not found: ${to}`);
+    }
+    
+    const idem = await IdempotencyEngine.start(idempotencyKey, from, { from, to, amount, description, mode });
+    
+    if (!idem.shouldProcess) {
+      if (idem.retryLater) {
+        throw new Error('Request is already being processed. Please retry later.');
+      }
+      return idem.response;
+    }
+    
+    let result;
+    let feeResult;
+    let freezeResult = null;
+    
+    try {
+      await LimitsEngine.check({ kp_id: from, amount });
+      feeResult = FeeEngine.applyFee({ amount });
+      
+      // 🔐 PARA MODO SECURE: CONGELAR SALDO ANTES DA TRANSAÇÃO
+      if (mode === 'SECURE') {
+        console.log(`🔐 Congelando ${feeResult.grossAmount} MZN para ${from} (SECURE)`);
+        
+        freezeResult = await FrozenBalanceService.freeze(
+          from, 
+          feeResult.grossAmount, 
+          'TRANSACTION_PENDING',
+          { 
+            to: to,
+            amount: feeResult.grossAmount,
+            mode: 'SECURE',
+            idempotencyKey: idempotencyKey
+          }
+        );
+        
+        console.log(`✅ Saldo congelado: ${freezeResult.frozen_balance} MZN congelados`);
+      }
+      
+      // Executar a transferência no ledger
+      result = await LedgerEngine.transfer({
+        fromKp: from,
+        toKp: to,
+        amount: feeResult.grossAmount,
+        reference: idempotencyKey,
+        description: description || `Transfer to ${to}`
+      });
+      
+      // Registrar taxa (fee)
+      if (feeResult.fee.total > 0) {
+        await prisma.transactionLedger.create({
+          data: {
+            kp_id: from,
+            type: 'DEBIT',
+            amount: feeResult.fee.total,
+            balance_before: result.from.balance + feeResult.fee.total,
+            balance_after: result.from.balance,
+            reference: `FEE-${result.transactionId}`,
+            status: mode === 'INSTANT' ? 'CONFIRMED' : 'PENDING',
+            metadata: {
+              transactionId: result.transactionId,
+              feeBreakdown: feeResult.fee.breakdown,
+              mode: mode
+            }
+          }
+        });
+      }
+      
+      let finalStatus = 'CONFIRMED';
+      let requiresConfirmation = false;
+      
+      if (mode === 'SECURE') {
+        finalStatus = 'PENDING';
+        requiresConfirmation = true;
+        
+        // Atualizar ledger entries para PENDING
+        await prisma.transactionLedger.updateMany({
+          where: {
+            OR: [
+              { reference: { startsWith: result.transactionId } },
+              { reference: `FEE-${result.transactionId}` }
+            ]
+          },
+          data: {
+            status: 'PENDING',
+            metadata: {
+              mode: mode,
+              pendingSince: new Date().toISOString(),
+              requiresConfirmation: true,
+              toKp: to,
+              fromKp: from,
+              frozen: true,
+              frozenAt: new Date().toISOString()
+            }
+          }
+        });
+        
+        // 🔐 Atualizar a transação com o estado congelado
+        await prisma.transaction.update({
+          where: { transactionId: result.transactionId },
+          data: {
+            status: 'PENDING',
+            metadata: {
+              ...result.metadata,
+              frozen: true,
+              frozenAt: new Date().toISOString(),
+              frozenAmount: feeResult.grossAmount
+            }
+          }
+        });
+        
+        // Notificar destinatário
+        WebSocketService.sendToUser(to, {
+          type: 'TRANSACTION_PENDING',
+          data: {
+            transactionId: result.transactionId,
+            from: from,
+            amount: feeResult.grossAmount,
+            message: `💰 Recebeste ${feeResult.grossAmount} MZN de ${from}. Confirma ou rejeita?`
+          }
+        });
+        
+        // Notificar remetente
+        WebSocketService.sendToUser(from, {
+          type: 'TRANSACTION_AWAITING_CONFIRMATION',
+          data: {
+            transactionId: result.transactionId,
+            to: to,
+            amount: feeResult.grossAmount,
+            message: `⏳ Transferência de ${feeResult.grossAmount} MZN aguardando confirmação de ${to} (saldo congelado)`
+          }
+        });
+        
+      } else {
+        // MODO INSTANT: confirmar imediatamente
+        await this.confirmTransaction(result.transactionId);
+      }
+      
+      await AuditService.logUserAction(from, 'TRANSFER', 'wallet', {
+        to,
+        amount,
+        transactionId: result.transactionId,
+        fee: feeResult.fee.total,
+        mode: mode,
+        status: finalStatus,
+        frozen: mode === 'SECURE',
+        frozenAmount: mode === 'SECURE' ? feeResult.grossAmount : null
+      });
+      
+      await IdempotencyEngine.complete(idempotencyKey, result);
+      
+      return {
+        success: true,
+        transactionId: result.transactionId,
+        mode: mode,
+        status: finalStatus,
+        requiresConfirmation: requiresConfirmation,
+        frozen: mode === 'SECURE',
+        frozenAmount: mode === 'SECURE' ? feeResult.grossAmount : null,
+        from: {
+          kp_id: from,
+          balance: result.from.balance,
+          available_balance: result.from.balance - (mode === 'SECURE' ? feeResult.grossAmount : 0)
+        },
+        to: {
+          kp_id: to,
+          balance: result.to.balance
+        },
+        amount: feeResult.grossAmount,
+        fee: feeResult.fee,
+        reference: idempotencyKey,
+        timestamp: new Date().toISOString()
+      };
+      
+    } catch (error) {
+      // 🔐 Em caso de erro, descongelar o saldo se foi congelado
+      if (mode === 'SECURE' && freezeResult) {
+        console.log(`🔄 Descongelando saldo para ${from} devido a erro: ${error.message}`);
+        try {
+          await FrozenBalanceService.unfreeze(
+            from,
+            feeResult.grossAmount,
+            'TRANSACTION_FAILED',
+            {
+              reason: error.message,
+              transactionId: result?.transactionId,
+              mode: 'SECURE'
+            }
+          );
+          console.log(`✅ Saldo descongelado para ${from}`);
+        } catch (unfreezeError) {
+          console.error(`❌ Erro ao descongelar saldo: ${unfreezeError.message}`);
+        }
+      }
+      
+      await IdempotencyEngine.fail(idempotencyKey, error.message);
+      await AuditService.logUserAction(from, 'TRANSFER_FAILED', 'wallet', {
+        to,
+        amount,
+        error: error.message,
+        mode: mode
+      });
+      throw error;
+    }
+  }
+  
+  static async confirmTransaction(transactionId) {
+    await prisma.transactionLedger.updateMany({
+      where: {
+        OR: [
+          { reference: { startsWith: transactionId } },
+          { reference: `FEE-${transactionId}` }
+        ]
+      },
+      data: {
+        status: 'CONFIRMED',
+        metadata: {
+          confirmedAt: new Date().toISOString()
+        }
+      }
+    });
+  }
+  
+  static async confirmByRecipient(transactionId, kp_id) {
+    const debitTransaction = await prisma.transactionLedger.findFirst({
+      where: {
+        reference: { startsWith: transactionId },
+        type: 'DEBIT'
+      }
+    });
+    
+    if (!debitTransaction) {
+      throw new Error('Transaction not found');
+    }
+    
+    const toKp = debitTransaction.metadata?.toKp || debitTransaction.metadata?.to;
+    if (!toKp || toKp !== kp_id) {
+      throw new Error('Only the recipient can confirm this transaction');
+    }
+    
+    if (debitTransaction.status !== 'PENDING') {
+      throw new Error(`Transaction already ${debitTransaction.status}`);
+    }
+    
+    // 🔐 CONFIRMAR: descongelar o saldo (já foi debitado pelo ledger)
+    // O saldo congelado já foi movido para o ledger, apenas descongelamos o que sobrou
+    // Na verdade, o frozen balance já foi debitado, então apenas confirmamos
+    await this.confirmTransaction(transactionId);
+    
+    // Buscar a transação para obter o valor
+    const transaction = await prisma.transaction.findUnique({
+      where: { transactionId }
+    });
+    
+    // 🔐 Após confirmação, remover o congelamento (o saldo já foi debitado)
+    try {
+      await FrozenBalanceService.unfreeze(
+        debitTransaction.kp_id,
+        Number(debitTransaction.amount),
+        'TRANSACTION_CONFIRMED',
+        {
+          transactionId: transactionId,
+          to: toKp,
+          confirmedBy: kp_id
+        }
+      );
+      console.log(`✅ Saldo descongelado para ${debitTransaction.kp_id} após confirmação`);
+    } catch (error) {
+      console.error(`❌ Erro ao descongelar saldo: ${error.message}`);
+    }
+    
+    WebSocketService.sendToUser(toKp, {
+      type: 'TRANSACTION_CONFIRMED',
+      data: {
+        transactionId,
+        amount: debitTransaction.amount,
+        message: `✅ Confirmaste recebimento de ${debitTransaction.amount} MZN`
+      }
+    });
+    
+    WebSocketService.sendToUser(debitTransaction.kp_id, {
+      type: 'TRANSACTION_CONFIRMED',
+      data: {
+        transactionId,
+        amount: debitTransaction.amount,
+        to: toKp,
+        message: `✅ ${toKp} confirmou recebimento de ${debitTransaction.amount} MZN`
+      }
+    });
+    
+    return { success: true, transactionId, status: 'CONFIRMED' };
+  }
+  
+  static async rejectByRecipient(transactionId, kp_id, reason = null) {
+    const debitTransaction = await prisma.transactionLedger.findFirst({
+      where: {
+        reference: { startsWith: transactionId },
+        type: 'DEBIT'
+      }
+    });
+    
+    if (!debitTransaction) {
+      throw new Error('Transaction not found');
+    }
+    
+    const toKp = debitTransaction.metadata?.toKp || debitTransaction.metadata?.to;
+    if (!toKp || toKp !== kp_id) {
+      throw new Error('Only the recipient can reject this transaction');
+    }
+    
+    if (debitTransaction.status !== 'PENDING') {
+      throw new Error(`Transaction already ${debitTransaction.status}`);
+    }
+    
+    // 🔐 REJEITAR: devolver o saldo congelado
+    const amount = Number(debitTransaction.amount);
+    const fromKp = debitTransaction.kp_id;
+    
+    // Descongelar o saldo
+    try {
+      await FrozenBalanceService.unfreeze(
+        fromKp,
+        amount,
+        'TRANSACTION_REJECTED',
+        {
+          transactionId: transactionId,
+          to: toKp,
+          rejectedBy: kp_id,
+          reason: reason || 'Rejected by recipient'
+        }
+      );
+      console.log(`✅ Saldo descongelado para ${fromKp} após rejeição`);
+    } catch (error) {
+      console.error(`❌ Erro ao descongelar saldo: ${error.message}`);
+    }
+    
+    // Reverter a transação no ledger
+    await this.reverseTransaction({
+      transactionId: transactionId,
+      reason: `Rejeitado pelo destinatário: ${reason || 'Sem motivo'}`
+    });
+    
+    WebSocketService.sendToUser(toKp, {
+      type: 'TRANSACTION_REJECTED',
+      data: {
+        transactionId,
+        amount: amount,
+        message: `❌ Rejeitaste recebimento de ${amount} MZN`
+      }
+    });
+    
+    WebSocketService.sendToUser(fromKp, {
+      type: 'TRANSACTION_REJECTED',
+      data: {
+        transactionId,
+        amount: amount,
+        to: toKp,
+        message: `❌ ${toKp} rejeitou recebimento de ${amount} MZN`
+      }
+    });
+    
+    return { success: true, transactionId, status: 'REJECTED' };
+  }
+  
+  static async reverseTransaction({ transactionId, reason = 'Refund requested', idempotencyKey = null }) {
+    const refundKey = idempotencyKey || `REFUND-${transactionId}-${Date.now()}`;
+    
+    const debitTransaction = await prisma.transactionLedger.findFirst({
+      where: {
+        reference: { startsWith: transactionId },
+        type: 'DEBIT'
+      }
+    });
+    
+    if (!debitTransaction) {
+      throw new Error(`Transaction not found: ${transactionId}`);
+    }
+    
+    const from = debitTransaction.metadata?.toKp || debitTransaction.metadata?.to || debitTransaction.kp_id;
+    const to = debitTransaction.kp_id;
+    const amount = Number(debitTransaction.amount);
+    
+    // 🔐 Na reversão, garantir que o saldo está descongelado
+    try {
+      await FrozenBalanceService.unfreeze(
+        to,
+        amount,
+        'TRANSACTION_REVERSED',
+        {
+          transactionId: transactionId,
+          reason: reason,
+          refundKey: refundKey
+        }
+      );
+    } catch (error) {
+      console.error(`❌ Erro ao descongelar saldo na reversão: ${error.message}`);
+    }
+    
+    const refundResult = await this.executeTransfer({
+      from: from,
+      to: to,
+      amount: amount,
+      idempotencyKey: refundKey,
+      description: `Refund of ${transactionId} - ${reason}`,
+      mode: 'INSTANT'
+    });
+    
+    await prisma.transactionLedger.updateMany({
+      where: {
+        OR: [
+          { reference: { startsWith: transactionId } },
+          { reference: `FEE-${transactionId}` }
+        ]
+      },
+      data: {
+        status: 'REVERSED',
+        metadata: {
+          reversedAt: new Date().toISOString(),
+          reversedReason: reason,
+          refundTransactionId: refundResult.transactionId
+        }
+      }
+    });
+    
+    return refundResult;
+  }
+  
+  static validateInput({ from, to, amount }) {
+    if (!from || !to || !amount) {
+      throw new Error('Missing required fields: from, to, amount');
+    }
+    if (from === to) {
+      throw new Error('Cannot transfer to yourself');
+    }
+    if (amount <= 0) {
+      throw new Error('Amount must be greater than 0');
+    }
+  }
+}
+
+module.exports = TransactionEngine;
+
+  /**
+   * Finalizar uma transação SECURE (remetente confirma com PIN/OTP)
+   * 🔐 Este é o passo final que torna a transferência irreversível
+   */
+  static async senderFinalize(transactionId, kp_id, pin = null) {
+    // 1. Buscar a transação
+    const transaction = await prisma.transaction.findUnique({
+      where: { transactionId }
+    });
+    
+    if (!transaction) {
+      throw new Error('Transaction not found');
+    }
+    
+    // 2. Verificar se é o remetente
+    if (transaction.from_kp !== kp_id) {
+      throw new Error('Only the sender can finalize this transaction');
+    }
+    
+    // 3. Verificar o status
+    if (transaction.status !== 'RECEIVER_ACCEPTED') {
+      throw new Error(`Cannot finalize transaction with status ${transaction.status}. Must be RECEIVER_ACCEPTED`);
+    }
+    
+    if (transaction.expired_at && new Date() > transaction.expired_at) {
+      await this.expireTransaction(transactionId);
+      throw new Error('Transaction has expired');
+    }
+    
+    // 4. Verificar PIN/OTP (se fornecido)
+    if (pin) {
+      // Verificar PIN do utilizador
+      const securityPin = await prisma.securityPin.findUnique({
+        where: { kp_id: kp_id }
+      });
+      
+      if (!securityPin) {
+        throw new Error('PIN not set up for this user');
+      }
+      
+      // Verificar se o PIN é válido
+      const bcrypt = require('bcrypt');
+      const isValid = await bcrypt.compare(pin, securityPin.pin_hash);
+      
+      if (!isValid) {
+        // Registrar tentativa falhada
+        await prisma.auditLog.create({
+          data: {
+            kp_id: kp_id,
+            action: 'FINALIZE_FAILED',
+            module: 'transaction',
+            details: {
+              transactionId,
+              reason: 'Invalid PIN'
+            }
+          }
+        });
+        throw new Error('Invalid PIN');
+      }
+    }
+    
+    // 5. 🔐 EXECUTAR O SETTLEMENT FINAL (IRREVERSÍVEL)
+    // Usar o LedgerEngine com mode: 'SECURE_CONFIRM' para libertar o frozen balance
+    const result = await LedgerEngine.transfer({
+      fromKp: transaction.from_kp,
+      toKp: transaction.to_kp,
+      amount: Number(transaction.amount),
+      reference: transactionId,
+      description: transaction.description || `Transfer to ${transaction.to_kp}`,
+      mode: 'SECURE_CONFIRM'  // 🔑 Liberta frozen_balance e debita balance
+    });
+    
+    // 6. Atualizar a transação para SETTLED
+    const updated = await prisma.transaction.update({
+      where: { transactionId },
+      data: {
+        status: 'SETTLED',
+        confirmed_at: new Date(),
+        confirmed_by: kp_id,
+        debit_entry_id: result.debitEntry?.id,
+        credit_entry_id: result.creditEntry?.id,
+        metadata: {
+          ...transaction.metadata,
+          finalized: true,
+          finalizedAt: new Date().toISOString(),
+          finalizedBy: kp_id,
+          pinVerified: !!pin,
+          ledgerResult: result
+        }
+      }
+    });
+    
+    // 7. Notificações
+    WebSocketService.sendToUser(transaction.from_kp, {
+      type: 'TRANSACTION_FINALIZED',
+      data: {
+        transactionId,
+        amount: transaction.amount,
+        to: transaction.to_kp,
+        message: `✅ Transferência de ${transaction.amount} MZN finalizada com sucesso! (irreversível)`
+      }
+    });
+    
+    WebSocketService.sendToUser(transaction.to_kp, {
+      type: 'TRANSACTION_FINALIZED',
+      data: {
+        transactionId,
+        amount: transaction.amount,
+        from: transaction.from_kp,
+        message: `✅ Transferência de ${transaction.amount} MZN finalizada e creditada na sua conta!`
+      }
+    });
+    
+    // 8. Audit Log
+    await prisma.auditLog.create({
+      data: {
+        kp_id: kp_id,
+        action: 'TRANSACTION_FINALIZED',
+        module: 'transaction',
+        details: {
+          transactionId,
+          amount: transaction.amount,
+          to: transaction.to_kp,
+          from: transaction.from_kp,
+          pinVerified: !!pin
+        }
+      }
+    });
+    
+    return { 
+      success: true, 
+      transactionId, 
+      status: 'SETTLED',
+      message: 'Transferência finalizada com sucesso!',
+      result
+    };
+  }

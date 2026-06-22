@@ -1,0 +1,76 @@
+import 'package:flutter/foundation.dart';
+import '../services/api_service.dart';
+
+class WalletProvider extends ChangeNotifier {
+  final ApiService _api = ApiService.instance;
+
+  double _balance = 0.0;
+  List<dynamic> _transactions = [];
+  bool _isLoading = false;
+
+  double get balance => _balance;
+  List<dynamic> get transactions => _transactions;
+  bool get isLoading => _isLoading;
+
+  void _setLoading(bool value) {
+    _isLoading = value;
+    notifyListeners();
+  }
+
+  Future<void> loadBalance() async {
+    _setLoading(true);
+
+    try {
+      _balance = await _api.balance();
+      debugPrint('💰 BALANCE LOADED: $_balance');
+    } catch (e) {
+      debugPrint('❌ BALANCE ERROR: $e');
+    } finally {
+      _setLoading(false);
+    }
+  }
+
+  Future<void> loadTransactions() async {
+    _setLoading(true);
+
+    try {
+      _transactions = await _api.transactions();
+      debugPrint('📊 TRANSACTIONS LOADED: ${_transactions.length}');
+    } catch (e) {
+      debugPrint('❌ TRANSACTIONS ERROR: $e');
+    } finally {
+      _setLoading(false);
+    }
+  }
+
+  Future<void> deposit(double amount) async {
+    try {
+      _balance = await _api.deposit(amount);
+      debugPrint('💰 DEPOSIT OK: $_balance');
+      await loadTransactions();
+      notifyListeners();
+    } catch (e) {
+      debugPrint('❌ DEPOSIT ERROR: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> transfer(String toAccount, double amount) async {
+    try {
+      _balance = await _api.transfer(toAccount, amount);
+      debugPrint('💰 TRANSFER OK: $_balance');
+      await loadTransactions();
+      notifyListeners();
+    } catch (e) {
+      debugPrint('❌ TRANSFER ERROR: $e');
+      rethrow;
+    }
+  }
+
+  void clear() {
+    _balance = 0.0;
+    _transactions = [];
+    _isLoading = false;
+    notifyListeners();
+  }
+}

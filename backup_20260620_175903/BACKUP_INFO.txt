@@ -1,0 +1,13 @@
+=====================================
+KULIPAPAY - BACKUP
+=====================================
+Data: $(date)
+Backup: $(basename $BACKUP_DIR)
+
+--- CONTEÚDO ---
+$(ls -la $BACKUP_DIR)
+
+--- SCHEMA PRISMA ---
+$(head -50 $BACKUP_DIR/schema.prisma 2>/dev/null || echo "N/A")
+
+=====================================

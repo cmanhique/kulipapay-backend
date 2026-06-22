@@ -1,0 +1,9 @@
+node_modules
+.git
+.env.backup
+*.log
+.DS_Store
+*.md
+mobile/
+docs/
+*.sql

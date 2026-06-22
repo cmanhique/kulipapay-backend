@@ -1,0 +1,425 @@
+const fastify = require('fastify');
+const cors = require('@fastify/cors');
+const rateLimit = require('@fastify/rate-limit');
+const bcrypt = require('bcrypt');
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const { PrismaClient } = require('@prisma/client');
+const eventBus = require('./events/eventBus');
+const eventTypes = require('./events/eventTypes');
+
+const app = fastify({ logger: true });
+const prisma = new PrismaClient();
+const SECRET = 'kulipapay-secret-key';
+
+app.register(cors, { origin: true });
+app.register(rateLimit, { max: 100, timeWindow: '1 minute' });
+
+app.get('/health', async () => ({ status: 'ok' }));
+
+// ============ AUTH ============
+
+app.post('/api/auth/register', async (request, reply) => {
+  try {
+    const { email, phone, password, name, country = 'MZ' } = request.body;
+    if (!phone || !password) return reply.status(400).send({ error: 'PHONE_AND_PASSWORD_REQUIRED' });
+    
+    const random = Math.floor(Math.random() * 100000000).toString().padStart(8, '0');
+    const kpId = `${country}-${random}-1`;
+    const hashedPassword = await bcrypt.hash(password, 12);
+    
+    const account = await prisma.account.create({
+      data: { kp_id: kpId, email: email || null, phone, name: name || null, password_hash: hashedPassword, account_type: 'INDIVIDUAL', status: 'ACTIVE', country }
+    });
+    
+    await prisma.wallet.create({ data: { kp_id: kpId, balance: 0 } });
+    
+    const accessToken = jwt.sign({ kpId, role: account.role }, SECRET, { expiresIn: '7d' });
+    const refreshToken = crypto.randomBytes(64).toString('hex');
+    
+    await prisma.session.create({
+      data: { kp_id: kpId, access_token: accessToken, refresh_token: refreshToken, expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), refresh_expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) }
+    });
+    
+    // Publicar evento
+    await eventBus.publish(eventTypes.USER_CREATED, { kpId, email, phone });
+    
+    return reply.send({ success: true, kpId, accessToken, refreshToken });
+  } catch (error) {
+    if (error.code === 'P2002') return reply.status(400).send({ error: 'ACCOUNT_ALREADY_EXISTS' });
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+app.post('/api/auth/login', async (request, reply) => {
+  try {
+    const { identifier, password } = request.body;
+    const isEmail = identifier.includes('@');
+    const account = await prisma.account.findFirst({ where: isEmail ? { email: identifier } : { phone: identifier } });
+    
+    if (!account) return reply.status(401).send({ error: 'INVALID_CREDENTIALS' });
+    
+    const valid = await bcrypt.compare(password, account.password_hash);
+    if (!valid) return reply.status(401).send({ error: 'INVALID_CREDENTIALS' });
+    
+    const accessToken = jwt.sign({ kpId: account.kp_id, role: account.role }, SECRET, { expiresIn: '7d' });
+    const refreshToken = crypto.randomBytes(64).toString('hex');
+    
+    await prisma.session.deleteMany({ where: { kp_id: account.kp_id } });
+    await prisma.session.create({
+      data: { kp_id: account.kp_id, access_token: accessToken, refresh_token: refreshToken, expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), refresh_expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) }
+    });
+    
+    // Publicar evento
+    await eventBus.publish(eventTypes.USER_LOGIN, { kpId: account.kp_id });
+    
+    return reply.send({ 
+      success: true, 
+      accessToken, 
+      refreshToken, 
+      kpId: account.kp_id, 
+      name: account.name,
+      role: account.role 
+    });
+  } catch (error) {
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+async function authenticate(request, reply) {
+  try {
+    const auth = request.headers.authorization;
+    if (!auth) return reply.status(401).send({ error: 'NO_TOKEN_PROVIDED' });
+    const token = auth.replace('Bearer ', '');
+    const session = await prisma.session.findUnique({ where: { access_token: token } });
+    if (!session || session.expires_at < new Date()) return reply.status(401).send({ error: 'INVALID_OR_EXPIRED_TOKEN' });
+    const decoded = jwt.verify(token, SECRET);
+    request.user = decoded;
+  } catch (err) {
+    return reply.status(401).send({ error: 'INVALID_TOKEN' });
+  }
+}
+
+app.post('/api/auth/logout', { preHandler: authenticate }, async (request, reply) => {
+  const token = request.headers.authorization?.replace('Bearer ', '');
+  if (token) {
+    await prisma.session.deleteMany({ where: { access_token: token } });
+    await eventBus.publish(eventTypes.USER_LOGOUT, { kpId: request.user.kpId });
+  }
+  return reply.send({ success: true });
+});
+
+app.get('/api/auth/me', { preHandler: authenticate }, async (request, reply) => {
+  const { kpId } = request.user;
+  const account = await prisma.account.findUnique({ where: { kp_id: kpId }, include: { wallet: true } });
+  return reply.send(account);
+});
+
+// ============ WALLET ============
+
+app.get('/api/wallet/balance', { preHandler: authenticate }, async (request, reply) => {
+  const { kpId } = request.user;
+  const wallet = await prisma.wallet.findUnique({ where: { kp_id: kpId } });
+  return reply.send({ balance: wallet?.balance || 0 });
+});
+
+app.post('/api/wallet/deposit', { preHandler: authenticate }, async (request, reply) => {
+  const { kpId } = request.user;
+  const { amount } = request.body;
+  if (!amount || amount <= 0) return reply.status(400).send({ error: 'INVALID_AMOUNT' });
+  
+  const wallet = await prisma.wallet.update({
+    where: { kp_id: kpId },
+    data: { balance: { increment: amount } }
+  });
+  
+  // Publicar evento de depósito
+  await eventBus.publish(eventTypes.DEPOSIT_CREATED, { kpId, amount, newBalance: wallet.balance });
+  
+  return reply.send({ success: true, balance: wallet.balance });
+});
+
+// TRANSFERÊNCIA COM EVENTOS
+app.post('/api/wallet/transfer', { preHandler: authenticate }, async (request, reply) => {
+  const { kpId: fromKp } = request.user;
+  const { toKp, amount } = request.body;
+  
+  if (!toKp) return reply.status(400).send({ error: 'DESTINATION_REQUIRED' });
+  if (!amount || amount <= 0) return reply.status(400).send({ error: 'INVALID_AMOUNT' });
+  if (fromKp === toKp) return reply.status(400).send({ error: 'SELF_TRANSFER' });
+  if (amount > 10000) return reply.status(400).send({ error: 'LIMIT_EXCEEDED' });
+  
+  // Publicar evento de transferência iniciada
+  await eventBus.publish(eventTypes.TRANSFER_CREATED, { from: fromKp, to: toKp, amount });
+  
+  const result = await prisma.$transaction(async (tx) => {
+    const fromWallet = await tx.wallet.findUnique({ where: { kp_id: fromKp } });
+    const toWallet = await tx.wallet.findUnique({ where: { kp_id: toKp } });
+    
+    if (!fromWallet || !toWallet) throw new Error('WALLET_NOT_FOUND');
+    if (fromWallet.balance < amount) throw new Error('INSUFFICIENT_BALANCE');
+    
+    await tx.wallet.update({ where: { kp_id: fromKp }, data: { balance: { decrement: amount } } });
+    await tx.wallet.update({ where: { kp_id: toKp }, data: { balance: { increment: amount } } });
+    
+    // Publicar evento de transferência concluída
+    await eventBus.publish(eventTypes.TRANSFER_COMPLETED, { from: fromKp, to: toKp, amount, status: 'success' });
+    
+    return { fromBalance: fromWallet.balance - amount };
+  });
+  
+  return reply.send({ success: true, fromBalance: result.fromBalance });
+});
+
+app.get('/api/wallet/transactions', { preHandler: authenticate }, async (request, reply) => {
+  const { kpId } = request.user;
+  const transactions = await prisma.transaction.findMany({
+    where: { OR: [{ from_kp: kpId }, { to_kp: kpId }] },
+    orderBy: { created_at: 'desc' },
+    take: 50
+  });
+  return reply.send({ transactions });
+});
+
+// ============ ADMIN ============
+
+async function requireAdmin(request, reply) {
+  const { role } = request.user;
+  if (role !== 'ADMIN') {
+    return reply.status(403).send({ error: 'FORBIDDEN', message: 'Admin access required' });
+  }
+}
+
+app.get('/api/admin/stats', { preHandler: [authenticate, requireAdmin] }, async (request, reply) => {
+  const [totalUsers, totalWallets, totalBalance] = await Promise.all([
+    prisma.account.count(),
+    prisma.wallet.count(),
+    prisma.wallet.aggregate({ _sum: { balance: true } })
+  ]);
+  
+  return reply.send({
+    stats: {
+      totalUsers,
+      totalWallets,
+      totalBalance: totalBalance._sum.balance || 0
+    }
+  });
+});
+
+// ============ EVENT LISTENER (Consumer) ============
+// Iniciar listener para processar eventos
+eventBus.subscribe((event) => {
+  console.log(`📨 Event received: ${event.type}`, event.data);
+  
+  // Aqui podes adicionar lógica de reação aos eventos
+  // Exemplo: atualizar dashboard, enviar notificações, detetar fraude, etc.
+  
+  if (event.type === eventTypes.TRANSFER_COMPLETED) {
+    console.log(`💰 Transfer completed: ${event.data.amount} from ${event.data.from} to ${event.data.to}`);
+  }
+  
+  if (event.type === eventTypes.FRAUD_ALERT) {
+    console.log(`⚠️ FRAUD ALERT: ${event.data.reason}`);
+  }
+});
+
+// ============ START ============
+const start = async () => {
+  try {
+    await app.listen({ port: 3000, host: '0.0.0.0' });
+    console.log('\n🏦 KulipaPay Server Running (Event-Driven)');
+    console.log('📡 http://localhost:3000');
+    console.log('❤️  http://localhost:3000/health\n');
+    console.log('📡 Event Bus: Redis active');
+    console.log('👂 Listening for events...\n');
+  } catch (err) {
+    console.error(err);
+    process.exit(1);
+  }
+};
+
+start();
+
+// ============ ADMIN ADVANCED ENDPOINTS ============
+
+// Top utilizadores por volume de transações
+app.get('/api/admin/top-users', { preHandler: [authenticate, requireAdmin] }, async (request, reply) => {
+  const { period = 'week', limit = 10 } = request.query;
+  
+  let dateFilter;
+  const now = new Date();
+  
+  switch (period) {
+    case 'day':
+      dateFilter = new Date(now.setDate(now.getDate() - 1));
+      break;
+    case 'week':
+      dateFilter = new Date(now.setDate(now.getDate() - 7));
+      break;
+    case 'month':
+      dateFilter = new Date(now.setMonth(now.getMonth() - 1));
+      break;
+    default:
+      dateFilter = new Date(now.setDate(now.getDate() - 30));
+  }
+  
+  const topUsers = await prisma.$queryRaw`
+    SELECT 
+      a.kp_id,
+      a.name,
+      a.email,
+      COUNT(l.id) as transaction_count,
+      SUM(l.amount) as total_volume
+    FROM "LedgerEntry" l
+    JOIN "Account" a ON l.from_kp = a.kp_id
+    WHERE l.created_at >= ${dateFilter}
+    GROUP BY a.kp_id, a.name, a.email
+    ORDER BY total_volume DESC
+    LIMIT ${parseInt(limit)}
+  `;
+  
+  return reply.send({ topUsers, period });
+});
+
+// Volume de transações por hora/dia
+app.get('/api/admin/volume-stats', { preHandler: [authenticate, requireAdmin] }, async (request, reply) => {
+  const { range = '7d' } = request.query;
+  
+  let days;
+  switch (range) {
+    case '24h': days = 1; break;
+    case '7d': days = 7; break;
+    case '30d': days = 30; break;
+    default: days = 7;
+  }
+  
+  const volumeStats = await prisma.$queryRaw`
+    SELECT 
+      DATE_TRUNC('day', created_at) as date,
+      COUNT(*) as transaction_count,
+      SUM(amount) as volume
+    FROM "LedgerEntry"
+    WHERE created_at >= NOW() - INTERVAL '${days} days'
+    GROUP BY DATE_TRUNC('day', created_at)
+    ORDER BY date ASC
+  `;
+  
+  return reply.send({ volumeStats, range: days + 'd' });
+});
+
+// Atividade por hora (mapa de calor)
+app.get('/api/admin/activity-heatmap', { preHandler: [authenticate, requireAdmin] }, async (request, reply) => {
+  const heatmap = await prisma.$queryRaw`
+    SELECT 
+      EXTRACT(DOW FROM created_at) as day_of_week,
+      EXTRACT(HOUR FROM created_at) as hour,
+      COUNT(*) as activity_count
+    FROM "LedgerEntry"
+    WHERE created_at >= NOW() - INTERVAL '30 days'
+    GROUP BY day_of_week, hour
+    ORDER BY day_of_week, hour
+  `;
+  
+  return reply.send({ heatmap });
+});
+
+// Resumo rápido do sistema
+app.get('/api/admin/summary', { preHandler: [authenticate, requireAdmin] }, async (request, reply) => {
+  const [totalVolume, todayVolume, activeUsers, avgTransaction] = await Promise.all([
+    prisma.ledgerEntry.aggregate({ _sum: { amount: true } }),
+    prisma.ledgerEntry.aggregate({
+      where: { created_at: { gte: new Date(new Date().setHours(0, 0, 0, 0)) } },
+      _sum: { amount: true }
+    }),
+    prisma.account.count({ where: { status: 'ACTIVE' } }),
+    prisma.ledgerEntry.aggregate({ _avg: { amount: true } })
+  ]);
+  
+  return reply.send({
+    totalVolume: totalVolume._sum.amount || 0,
+    todayVolume: todayVolume._sum.amount || 0,
+    activeUsers,
+    avgTransaction: avgTransaction._avg.amount || 0
+  });
+});
+
+// ============ ADMIN UTILIZADORES ============
+
+// Listar todos os utilizadores
+app.get('/api/admin/users', { preHandler: [authenticate, requireAdmin] }, async (request, reply) => {
+  try {
+    const { page = 1, limit = 50, search = '' } = request.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    const where = search ? {
+      OR: [
+        { email: { contains: search, mode: 'insensitive' } },
+        { phone: { contains: search } },
+        { name: { contains: search, mode: 'insensitive' } },
+        { kp_id: { contains: search } }
+      ]
+    } : {};
+    
+    const [users, total] = await Promise.all([
+      prisma.account.findMany({
+        where,
+        skip,
+        take: parseInt(limit),
+        include: { wallet: true },
+        orderBy: { created_at: 'desc' }
+      }),
+      prisma.account.count({ where })
+    ]);
+    
+    return reply.send({ users, total, page: parseInt(page), totalPages: Math.ceil(total / parseInt(limit)) });
+  } catch (error) {
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+// Bloquear/Desbloquear utilizador
+app.post('/api/admin/users/:kpId/toggle-block', { preHandler: [authenticate, requireAdmin] }, async (request, reply) => {
+  try {
+    const { kpId } = request.params;
+    
+    const user = await prisma.account.findUnique({
+      where: { kp_id: kpId },
+      select: { status: true }
+    });
+    
+    if (!user) {
+      return reply.status(404).send({ error: 'USER_NOT_FOUND' });
+    }
+    
+    const newStatus = user.status === 'BLOCKED' ? 'ACTIVE' : 'BLOCKED';
+    
+    await prisma.account.update({
+      where: { kp_id: kpId },
+      data: { status: newStatus }
+    });
+    
+    return reply.send({ success: true, status: newStatus });
+  } catch (error) {
+    return reply.status(500).send({ error: error.message });
+  }
+});
+
+// Estatísticas de transações por dia (últimos 7 dias)
+app.get('/api/admin/chart-data', { preHandler: [authenticate, requireAdmin] }, async (request, reply) => {
+  try {
+    const chartData = await prisma.$queryRaw`
+      SELECT 
+        DATE(created_at) as date,
+        COUNT(*) as count,
+        SUM(amount) as total
+      FROM "LedgerEntry"
+      WHERE created_at >= NOW() - INTERVAL '7 days'
+      GROUP BY DATE(created_at)
+      ORDER BY date ASC
+    `;
+    
+    return reply.send({ chartData });
+  } catch (error) {
+    return reply.status(500).send({ error: error.message });
+  }
+});

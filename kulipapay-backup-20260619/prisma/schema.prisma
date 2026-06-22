@@ -1,0 +1,495 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AccountType {
+  INDIVIDUAL
+  MERCHANT
+  BUSINESS
+}
+
+enum KycStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum LedgerStatus {
+  PENDING
+  SETTLED
+  FAILED
+}
+
+model Account {
+  id            String  @id @default(uuid())
+  kp_id         String  @unique
+  email         String? @unique
+  phone         String  @unique
+  name          String?
+  password_hash String
+
+  account_type AccountType @default(INDIVIDUAL)
+  role         String      @default("USER")
+  status       String      @default("ACTIVE")
+  country      String      @default("MZ")
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  wallet          Wallet?
+  agent           Agent?
+  kyc             KycProfile?
+  sessions        Session[]
+  security_pin    SecurityPin?
+  risk_score      RiskScore?
+  fraud_alerts    FraudAlert[]
+  blocked_actions BlockedAction[]
+  otp_codes       OtpCode[]
+  transaction_ledger TransactionLedger[]
+
+  ledger_from LedgerEntry[] @relation("FromAccount")
+  ledger_to   LedgerEntry[] @relation("ToAccount")
+
+  @@map("accounts")
+}
+
+
+model WalletLock {
+  kp_id     String   @id
+  locked_at DateTime @default(now())
+
+  @@map("wallet_locks")
+}
+
+model Agent {
+  id    String @id @default(uuid())
+  kp_id String @unique
+
+  business_name String
+  phone         String  @unique
+  email         String? @unique
+
+  float_balance   Decimal @default(0) @db.Decimal(18, 2)
+  commission_rate Decimal @default(0.3) @db.Decimal(5, 2)
+
+  status    String  @default("PENDING")
+  location  String?
+  latitude  Float?
+  longitude Float?
+
+  total_deposits   Decimal @default(0) @db.Decimal(18, 2)
+  total_withdraws  Decimal @default(0) @db.Decimal(18, 2)
+  total_commission Decimal @default(0) @db.Decimal(18, 2)
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  account      Account            @relation(fields: [kp_id], references: [kp_id])
+  transactions AgentTransaction[]
+
+  @@index([kp_id])
+  @@index([status])
+  @@map("agents")
+}
+
+model AgentTransaction {
+  id String @id @default(uuid())
+
+  agent_kp    String
+  customer_kp String
+
+  type   String
+  amount Decimal @db.Decimal(18, 2)
+
+  fee_customer Decimal @db.Decimal(18, 2)
+  fee_agent    Decimal @db.Decimal(18, 2)
+  fee_company  Decimal @db.Decimal(18, 2)
+
+  reference String @unique
+  status    String @default("COMPLETED")
+
+  created_at DateTime @default(now())
+
+  agent Agent @relation(fields: [agent_kp], references: [kp_id])
+
+  @@index([agent_kp])
+  @@index([customer_kp])
+  @@map("agent_transactions")
+}
+
+model LedgerEntry {
+  id String @id @default(uuid())
+
+  transaction_id String @unique
+  reference      String @unique
+
+  from_kp String
+  to_kp   String
+
+  amount Decimal @db.Decimal(18, 2)
+  type   String
+
+  status LedgerStatus @default(SETTLED)
+
+  debit_entries  Json
+  credit_entries Json
+
+  previous_hash String
+  current_hash  String @unique
+
+  description String?
+  metadata    Json    @default("{}")
+
+  created_at DateTime  @default(now())
+  settled_at DateTime?
+
+  from_account Account @relation("FromAccount", fields: [from_kp], references: [kp_id])
+  to_account   Account @relation("ToAccount", fields: [to_kp], references: [kp_id])
+
+  @@index([from_kp])
+  @@index([to_kp])
+  @@index([status])
+  @@map("ledger_entries")
+}
+
+model BalanceSnapshot {
+  id    String @id @default(uuid())
+  kp_id String
+
+  balance Decimal @db.Decimal(18, 2)
+  version Int
+
+  created_at DateTime @default(now())
+
+  @@index([kp_id])
+  @@map("balance_snapshots")
+}
+
+model Session {
+  id    String @id @default(uuid())
+  kp_id String
+
+  access_token  String @unique
+  refresh_token String @unique
+
+  family_id   String?
+  device_id   String?
+  ip          String?
+  user_agent  String?
+  fingerprint String?
+
+  revoked Boolean @default(false)
+
+  expires_at         DateTime
+  refresh_expires_at DateTime
+
+  created_at DateTime @default(now())
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@index([kp_id])
+  @@index([family_id])
+  @@index([device_id])
+  @@index([refresh_token])
+  @@map("sessions")
+}
+
+model OtpCode {
+  id         String   @id @default(uuid())
+  kp_id      String
+  code       String
+  type       String   @default("LOGIN")
+  expires_at DateTime
+  used       Boolean  @default(false)
+  attempts   Int      @default(0)
+
+  created_at DateTime @default(now())
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@index([kp_id])
+  @@index([code])
+  @@map("otp_codes")
+}
+
+model SecurityPin {
+  id    String @id @default(uuid())
+  kp_id String @unique
+
+  pin_hash     String
+  attempts     Int       @default(0)
+  locked_until DateTime?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("security_pins")
+}
+
+model RiskScore {
+  id    String @id @default(uuid())
+  kp_id String @unique
+
+  score Int    @default(0)
+  level String @default("LOW")
+
+  last_updated DateTime @default(now())
+  updated_at   DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("risk_scores")
+}
+
+model FraudAlert {
+  id    String @id @default(uuid())
+  kp_id String
+
+  type     String
+  severity String
+
+  details Json
+
+  resolved    Boolean   @default(false)
+  created_at  DateTime  @default(now())
+  resolved_at DateTime?
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@index([kp_id])
+  @@map("fraud_alerts")
+}
+
+model BlockedAction {
+  id    String @id @default(uuid())
+  kp_id String
+
+  action String
+  reason String
+
+  expires_at DateTime?
+  created_at DateTime  @default(now())
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@index([kp_id])
+  @@map("blocked_actions")
+}
+
+model KycProfile {
+  id String @id @default(uuid())
+
+  kp_id String @unique
+
+  type   AccountType @default(INDIVIDUAL)
+  status KycStatus   @default(PENDING)
+
+  full_name     String?
+  business_name String?
+  address       String?
+  city          String?
+
+  document_type   String?
+  document_number String?
+
+  proof_address String?
+  tax_number    String?
+
+  files Json
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@index([kp_id])
+  @@index([type])
+  @@index([status])
+  @@map("kyc_profiles")
+}
+
+model TransactionLedger {
+  id              String   @id @default(uuid())
+  kp_id           String
+  type            String   // DEBIT | CREDIT
+  amount          Decimal  @db.Decimal(18, 2)
+  balance_before  Decimal  @db.Decimal(18, 2)
+  balance_after   Decimal  @db.Decimal(18, 2)
+  reference       String   @unique
+  status          String   // PENDING | CONFIRMED | REVERSED
+  metadata        Json?    @default("{}")
+  
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@index([kp_id])
+  @@index([reference])
+  @@index([status])
+  @@map("transaction_ledger")
+}
+
+model IdempotencyKey {
+  id            String   @id @default(uuid())
+  key           String   @unique
+  kp_id         String
+  request_hash  String
+  response      Json?
+  status        String   @default("PROCESSING")
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  @@index([kp_id])
+  @@index([key])
+  @@map("idempotency_keys")
+}
+model AuditLog {
+  id         String   @id @default(uuid())
+  kp_id      String
+  action     String   // POLICY_DECISION, USER_ACTION, etc
+  module     String?
+  details    Json
+  metadata   Json     @default("{}")
+  created_at DateTime @default(now())
+
+  @@index([kp_id])
+  @@index([action])
+  @@index([created_at])
+  @@map("audit_logs")
+}
+
+// =========================
+// TRANSACTION DOMAIN
+// =========================
+model Transaction {
+  id              String   @id @default(uuid())
+  transactionId   String   @unique
+  from_kp         String
+  to_kp           String
+  amount          Decimal  @db.Decimal(18, 2)
+  fee             Decimal  @db.Decimal(18, 2) @default(0)
+  status          TransactionStatus @default(PENDING)
+  mode            TransactionMode   @default(SECURE)
+  
+  // Ledger references
+  debit_entry_id  String?  // Referência ao LedgerEntry (DEBIT)
+  credit_entry_id String?  // Referência ao LedgerEntry (CREDIT)
+  fee_entry_id    String?  // Referência ao LedgerEntry (FEE)
+  
+  // Confirmation
+  confirmed_at    DateTime?
+  rejected_at     DateTime?
+  expired_at      DateTime?
+  confirmed_by    String?
+  rejected_by     String?
+  
+  // Idempotency
+  idempotency_key String?  @unique
+  
+  // Metadata
+  description     String?
+  metadata        Json?    @default("{}")
+  
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  @@index([from_kp])
+  @@index([to_kp])
+  @@index([status])
+  @@index([transactionId])
+  @@map("transactions")
+}
+
+enum TransactionStatus {
+  PENDING
+  RESERVED
+  CONFIRMED
+  REJECTED
+  EXPIRED
+  REVERSED
+}
+
+enum TransactionMode {
+  INSTANT
+  SECURE
+}
+
+// Se o campo expired_at não existir, adicionar
+// expired_at    DateTime?
+
+// =========================
+// ESCROW TRANSACTION
+// =========================
+model EscrowTransaction {
+  id              String   @id @default(uuid())
+  transactionId   String   @unique
+  
+  buyer_kp        String   // Comprador
+  seller_kp       String   // Vendedor
+  amount          Decimal  @db.Decimal(18, 2)
+  fee             Decimal  @db.Decimal(18, 2) @default(0)
+  
+  status          EscrowStatus @default(PENDING)
+  
+  // Condições
+  condition       String?  // Ex: "Entrega do produto"
+  condition_met   Boolean  @default(false)
+  
+  // Datas
+  held_at         DateTime?
+  released_at     DateTime?
+  disputed_at     DateTime?
+  refunded_at     DateTime?
+  expires_at      DateTime?
+  
+  // Ledger references
+  escrow_entry_id String?  // Referência ao LedgerEntry (fundos em custódia)
+  release_entry_id String? // Referência ao LedgerEntry (libertação)
+  refund_entry_id String?  // Referência ao LedgerEntry (reembolso)
+  
+  // Metadados
+  metadata        Json?    @default("{}")
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  @@index([buyer_kp])
+  @@index([seller_kp])
+  @@index([status])
+  @@map("escrow_transactions")
+}
+
+enum EscrowStatus {
+  PENDING
+  HELD
+  RELEASED
+  DISPUTED
+  REFUNDED
+  EXPIRED
+}
+
+// ATUALIZAR O MODELO WALLET
+
+model Wallet {
+  id    String @id @default(uuid())
+  kp_id String @unique
+
+  balance          Decimal @default(0) @db.Decimal(18, 2)
+  frozen_balance   Decimal @default(0) @db.Decimal(18, 2)
+  available_balance Decimal @default(0) @db.Decimal(18, 2)
+  version          Int     @default(1)
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  account Account @relation(fields: [kp_id], references: [kp_id])
+
+  @@map("wallets")
+}
